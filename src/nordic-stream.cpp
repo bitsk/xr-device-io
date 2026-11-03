@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Real A081 transport input. Controller clock and integrated vector retain
 // their original semantics: neither is an OpenXR pose or Linux timestamp.
-#include <qiyu/device/a081_controller_reference.hpp>
+#include <xr/device/a081_controller_reference.hpp>
 #include <linux/a081-nordic.h>
 #include <array>
 #include <cerrno>
@@ -18,7 +18,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <time.h>
-#include <qiyu/device/a081_radio_clock_reference.h>
+#include <xr/device/a081_radio_clock_reference.h>
 
 static volatile sig_atomic_t stopped;
 static void stop(int) { stopped=1; }

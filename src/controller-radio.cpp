@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Single real Nordic transport owner: forward raw packets to the SDK helper,
 // optionally return timestamps of actual camera frames. Never pairs or flashes.
-#include <qiyu/device/a081_controller_input_wire.h>
-#include <qiyu/device/a081_radio_clock_reference.h>
+#include <xr/device/a081_controller_input_wire.h>
+#include <xr/device/a081_radio_clock_reference.h>
 #define _Static_assert static_assert
-#include <qiyu/device/a081_controller_wire.h>
+#include <xr/device/a081_controller_wire.h>
 #undef _Static_assert
-#include <qiyu/device/a081_camera_timing.hpp>
+#include <xr/device/a081_camera_timing.hpp>
 #include <linux/a081-nordic.h>
 #include <array>
 #include <cerrno>

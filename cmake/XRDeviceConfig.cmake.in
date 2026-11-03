@@ -1,0 +1,5 @@
+@PACKAGE_INIT@
+include("${CMAKE_CURRENT_LIST_DIR}/XRDeviceTargets.cmake")
+find_path(XR_KERNEL_UAPI_DIR linux/a081-nordic.h HINTS "${PACKAGE_PREFIX_DIR}/include/xr-kernel" /usr/include/xr-kernel REQUIRED)
+set_property(TARGET XRDevice::api APPEND PROPERTY INTERFACE_INCLUDE_DIRECTORIES "${XR_KERNEL_UAPI_DIR}")
+check_required_components(XRDevice)

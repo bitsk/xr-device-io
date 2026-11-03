@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
-#include <qiyu/device/a081_camera_metadata.hpp>
-#include <qiyu/device/a081_camera_pattern.hpp>
+#include <xr/device/a081_camera_metadata.hpp>
+#include <xr/device/a081_camera_pattern.hpp>
 #include <array>
 #include <deque>
 #include <functional>

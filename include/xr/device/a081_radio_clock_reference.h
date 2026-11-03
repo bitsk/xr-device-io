@@ -1,7 +1,7 @@
 #ifndef A081_RADIO_CLOCK_REFERENCE_H
 #define A081_RADIO_CLOCK_REFERENCE_H
 
-#include <qiyu/device/a081_controller_abi.h>
+#include <xr/device/a081_controller_abi.h>
 
 /* Pure arithmetic/packing recovered from the pinned A081 stock binaries.
  * No device IO, TX, clock mutation, sensor generation, or ready flag.

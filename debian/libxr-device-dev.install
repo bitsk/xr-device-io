@@ -1,0 +1,3 @@
+usr/include/xr/device/*
+usr/lib/*/libxr_device_abi.a
+usr/lib/*/cmake/XRDevice/*

@@ -1,0 +1,6 @@
+#!/usr/bin/make -f
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+%:
+	dh $@ --buildsystem=cmake
+override_dh_auto_configure:
+	dh_auto_configure -- $(if $(XR_KERNEL_UAPI_DIR),-DXR_KERNEL_UAPI_DIR=$(XR_KERNEL_UAPI_DIR)) $(if $(XR_DEVICE_PREFIX),-DCMAKE_PREFIX_PATH=$(XR_DEVICE_PREFIX))

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
-#include <qiyu/device/a081_controller_input_wire.h>
-#include <qiyu/head/a081_tracking_wire.h>
-#include <qiyu/device/a081_camera_groups.hpp>
-#include <qiyu/device/a081_camera_pixels.hpp>
-#include <qiyu/device/a081_camera_timing.hpp>
+#include <xr/device/a081_controller_input_wire.h>
+#include <xr/head/a081_tracking_wire.h>
+#include <xr/device/a081_camera_groups.hpp>
+#include <xr/device/a081_camera_pixels.hpp>
+#include <xr/device/a081_camera_timing.hpp>
 #include <cmath>
 #include <cstdlib>
 #include <deque>

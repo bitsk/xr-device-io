@@ -1,7 +1,7 @@
 #ifndef A081_CONTROLLER_WIRE_H
 #define A081_CONTROLLER_WIRE_H
 
-#include <qiyu/device/a081_controller_abi.h>
+#include <xr/device/a081_controller_abi.h>
 
 #include <float.h>
 #include <stddef.h>

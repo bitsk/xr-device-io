@@ -1,0 +1,9 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: xr-device-io
+Source: https://gitee.com/bigbits/xr-device-io
+
+Files: *
+Copyright: See original source file and license notices
+License: GPL-3.0-or-later
+ See the repository license files and individual file headers.
+ Third-party notices and licenses remain applicable.

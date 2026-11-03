@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include <qiyu/device/abi_reference.hpp>
+#include <xr/device/abi_reference.hpp>
 #include <cstdint>
 #include <cstring>
 #include <linux/videodev2.h>

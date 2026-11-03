@@ -4,8 +4,8 @@
 // Real-device camera input component. The kernel owner configures the media
 // graph and sensor controls first. No graph, GPIO, exposure or sync policy is
 // guessed here. Capturing images is separate from admitting them to QVR.
-#include <qiyu/device/a081_camera_metadata.hpp>
-#include <qiyu/device/camera-preview.hpp>
+#include <xr/device/a081_camera_metadata.hpp>
+#include <xr/device/camera-preview.hpp>
 #include <array>
 #include <atomic>
 #include <cerrno>
