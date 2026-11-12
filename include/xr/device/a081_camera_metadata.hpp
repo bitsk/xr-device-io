@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include <xr/device/a081_camera_pixels.hpp>
+#include <xr/device/camera-preview.hpp>
 #include <xr/device/a081_camera_timing.hpp>
 #include <linux/qcom-camss-timing.h>
 #include <algorithm>
@@ -250,6 +251,7 @@ public:
         return joined_ > 0 && !rejected_ && !invalid_metadata_ && !dropped_ && !missing_metadata_;
     }
 private:
+    a081::preview::Tap preview_;
     struct Entry { Timing record; bool valid; };
     void match(std::uint32_t sequence)
     {
@@ -281,6 +283,10 @@ private:
                       << " stock_y8_submit_ns=" << (interpreted ? stock_time.submit_boottime_ns : 0)
                       << " qvr_submitted=0" << std::endl;
         }
+        preview_.timed_y8(slot_, sequence, i.receive_monotonic_ns, i.y8.data(), i.y8.size(),
+            valid, valid && valid_pattern_exposure(t), t.exposure_phase, effective_exposure,
+            t.sensor_sequence, t.sof_monotonic_ns, t.stream_id, t.phase_anchor_sof_qtimer,
+            t.exposure_status, t.flags);
         if (valid && publish_) publish_(TimedFrame{std::move(image->second), t});
         images_.erase(image); timings_.erase(meta);
     }

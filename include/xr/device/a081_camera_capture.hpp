@@ -6,6 +6,7 @@
 // guessed here. Capturing images is separate from admitting them to QVR.
 #include <xr/device/a081_camera_metadata.hpp>
 #include <xr/device/camera-preview.hpp>
+#include <xr/device/passthrough-capture.hpp>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -206,7 +207,7 @@ public:
             std::cout << "stage=camera_snapshot slot=" << slot << " sequence=" << buffer.sequence
                       << " prefix=" << std::quoted(prefix) << " projection=linear_msb8" << std::endl;
         }
-        if (converted) preview_.y8(slot, buffer.sequence, receive_mono, y8.data(), y8.size());
+        if (converted && !frame) preview_.y8(slot, buffer.sequence, receive_mono, y8.data(), y8.size());
         if (frame) *frame = {std::move(y8), buffer.sequence, buffer.index, buffer.flags,
                             timestamp, receive_mono, receive_boot};
         return true;
@@ -280,6 +281,8 @@ inline int capture_live(const CaptureCallbacks *callbacks = nullptr)
     std::atomic<bool> stop_workers{false}, worker_failed{false};
     std::atomic<bool> stop_timing_workers{false};
     std::vector<std::thread> workers;
+    std::vector<std::thread> passthrough_workers;
+    std::vector<std::unique_ptr<device::passthrough::Capture>> passthrough;
     std::vector<std::thread> timing_workers;
     std::vector<std::unique_ptr<TimingStream>> timings;
     std::vector<std::unique_ptr<TimingJoin>> joiners;
@@ -327,6 +330,28 @@ inline int capture_live(const CaptureCallbacks *callbacks = nullptr)
             cameras.push_back(std::move(capture));
         }
         if (cameras.empty()) throw std::runtime_error("Camera node list is empty");
+        // Optional IMX failures are isolated from the four tracking inputs.
+        // No second process may bypass or share the hardware lock.
+        if (const char *imx_nodes = std::getenv("A081_PASSTHROUGH_CAMERA_NODES")) {
+            try {
+                std::istringstream imx_input(imx_nodes);
+                while (std::getline(imx_input, node, ',')) {
+                    if (passthrough.size() == 2) throw std::runtime_error("Expected exactly two IMX nodes");
+                    auto imx = std::make_unique<device::passthrough::Capture>();
+                    imx->open(node.c_str());
+                    for (const auto &tracking : cameras)
+                        if (tracking->device() == imx->device()) throw std::runtime_error("IMX aliases a tracking input");
+                    for (const auto &other : passthrough)
+                        if (other->device() == imx->device()) throw std::runtime_error("Duplicate IMX input");
+                    passthrough.push_back(std::move(imx));
+                }
+                if (passthrough.size() != 2) throw std::runtime_error("Expected exactly two IMX nodes");
+            } catch (const std::exception &error) {
+                passthrough.clear();
+                std::lock_guard<std::mutex> log(output_mutex);
+                std::cerr << "stage=passthrough_error tracking_continues=1 detail=" << std::quoted(error.what()) << std::endl;
+            }
+        }
         if (const char *timing_nodes = std::getenv("A081_QVR_CAMERA_TIMING_NODES")) {
             if (cameras.size() != 4) throw std::runtime_error("QCFT mode requires the validated four-slot A081 graph");
             const char *exposure = std::getenv("A081_QVR_CAMERA_EXPOSURE_NS");
@@ -428,6 +453,28 @@ inline int capture_live(const CaptureCallbacks *callbacks = nullptr)
             }
             });
         }
+        passthrough_workers.reserve(passthrough.size());
+        for (unsigned i = 0; i < passthrough.size(); ++i) {
+            passthrough_workers.emplace_back([&, i] {
+                try {
+                    auto &imx = *passthrough[i];
+                    imx.start();
+                    while (!stop_workers.load() && !stopped) {
+                        pollfd descriptor{imx.fd(), POLLIN, 0};
+                        const int rc = poll(&descriptor, 1, 100);
+                        if (rc < 0 && errno == EINTR) continue;
+                        checked(rc, "IMX poll");
+                        if (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))
+                            throw std::runtime_error("IMX poll error");
+                        if (descriptor.revents & POLLIN) imx.frame(i + 4);
+                    }
+                } catch (const std::exception &error) {
+                    std::lock_guard<std::mutex> log(output_mutex);
+                    std::cerr << "stage=passthrough_error slot=" << i + 4
+                              << " tracking_continues=1 detail=" << std::quoted(error.what()) << std::endl;
+                }
+            });
+        }
         while (!stopped && !worker_failed.load() && !(callbacks && callbacks->abort && callbacks->abort->load()) &&
                (continuous || clock_ns(CLOCK_BOOTTIME) - start < std::uint64_t(seconds) * 1000000000ULL)) {
             pollfd stop_request{stop_fd, POLLIN, 0};
@@ -461,6 +508,15 @@ inline int capture_live(const CaptureCallbacks *callbacks = nullptr)
     }
     stop_workers.store(true);
     for (auto &worker : workers) worker.join();
+    for (auto &worker : passthrough_workers) worker.join();
+    for (unsigned i = 0; i < passthrough.size(); ++i) {
+        auto &imx = *passthrough[i];
+        const bool released = imx.close();
+        std::lock_guard<std::mutex> log(output_mutex);
+        std::cout << "stage=passthrough_summary slot=" << i + 4 << " frames=" << imx.frames
+                  << " error_frames=" << imx.invalid << " released=" << released
+                  << " tracking_failure=0 color_calibrated=0" << std::endl;
+    }
     ok = !worker_failed.load() && ok;
     for (unsigned i = 0; i < cameras.size(); ++i) {
         auto &camera = *cameras[i];

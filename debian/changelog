@@ -1,3 +1,10 @@
+xr-device-io (0.1.2) unstable; urgency=medium
+
+  * Restore the validated IMX capture and QSP snapshot tap under the camera owner.
+  * Preserve joined QCFT phase metadata in the shared preview tap.
+
+ -- bits <bigbits@hackx.cc>  Thu, 12 Nov 2026 17:14:26 +0800
+
 xr-device-io (0.1.1) unstable; urgency=medium
 
   * Add optional nonblocking long-exposure hand frame tap.
