@@ -3,7 +3,7 @@
 共享相机/IMU、原始手柄传输、时间戳和缓冲所有权。
 
 
-构建入口和依赖见下方；工程 Wiki/Blog 与跨仓库规划集中在 [openkylin-xr-docs](https://gitee.com/bigbits/openkylin-xr-docs)。
+构建入口和依赖见下方；工程 Wiki/Blog 与跨仓库规划集中在 [openkylin-xr-docs](https://github.com/bitsk/openkylin-xr-docs)。
 
 ## 构建
 

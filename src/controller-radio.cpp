@@ -110,7 +110,7 @@ int main(int argc, char **argv) try {
         socket_path.empty() || socket_path.front() != '/' || socket_path.size() >= sizeof(sockaddr_un::sun_path))
         throw std::runtime_error("Expected root A081 and absolute socket");
     const auto root = read_file("/etc/a081-rootfs-id");
-    if (root != "a081-steamos-arm64\n" && root != "a081-debian-trixie-arm64\n") throw std::runtime_error("Unexpected rootfs");
+    if (root != "a081-steamos-arm64\n" && root != "a081-debian-trixie-arm64\n" && root != "a081-openkylin-3.0-arm64\n") throw std::runtime_error("Unexpected rootfs");
     Fd lock; lock.fd = open("/run/mix-xr-stock-controller.lock", O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (lock.fd < 0 || flock(lock.fd, LOCK_EX | LOCK_NB)) throw std::runtime_error("Controller lock busy");
     struct stat st{};

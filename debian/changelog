@@ -1,3 +1,9 @@
+xr-device-io (0.1.3) unstable; urgency=medium
+
+  * Complete the shared camera tools and restore the deployed board identity.
+
+ -- bits <bigbits@hackx.cc>  Thu, 12 Nov 2026 19:14:34 +0800
+
 xr-device-io (0.1.2) unstable; urgency=medium
 
   * Restore the validated IMX capture and QSP snapshot tap under the camera owner.
