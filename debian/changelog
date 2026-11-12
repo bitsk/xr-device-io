@@ -1,3 +1,9 @@
+xr-device-io (0.1.1) unstable; urgency=medium
+
+  * Add optional nonblocking long-exposure hand frame tap.
+
+ -- bits <bigbits@hackx.cc>  Thu, 12 Nov 2026 10:43:15 +0800
+
 xr-device-io (0.1.0) unstable; urgency=medium
 
   * Import independently maintained XR component and packaging.

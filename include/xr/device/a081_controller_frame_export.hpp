@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include <xr/device/a081_controller_input_wire.h>
-#include <xr/head/a081_tracking_wire.h>
+#include <xr/head/production-v2/a081_tracking_wire.h>
 #include <xr/device/a081_camera_groups.hpp>
 #include <xr/device/a081_camera_pixels.hpp>
 #include <xr/device/a081_camera_timing.hpp>
@@ -23,9 +23,10 @@ namespace a081::stock::controller {
 // No second camera open, synthetic frame, timestamp replacement or prediction.
 class FrameExporter {
 public:
-    FrameExporter()
+    explicit FrameExporter(const char *environment_key = "A081_CONTROLLER_INPUT_SOCKET")
+        : hand_observer_(std::string(environment_key) == "A081_HAND_INPUT_SOCKET")
     {
-        const char *path = std::getenv("A081_CONTROLLER_INPUT_SOCKET");
+        const char *path = std::getenv(environment_key);
         if (!path || !*path) return;
         if (geteuid() != 0 || path[0] != '/' || std::strlen(path) >= sizeof(sockaddr_un::sun_path))
             throw std::runtime_error("Invalid controller frame endpoint");
@@ -64,6 +65,9 @@ public:
     {
         if (path_.empty()) return;
         const auto &meta = group.frames[2].timing;
+        // A separate observer consumes only matched long-exposure groups.
+        // The existing controller exporter continues receiving every phase.
+        if (hand_observer_ && (meta.exposure_phase != 2 || !connect())) return;
         if (!camera::valid_pattern_exposure(meta) || !camera::valid_pattern_exposure(group.frames[3].timing)) {
             ++dropped_; return;
         }
@@ -183,6 +187,7 @@ private:
         }
         fd_ = fd; return true;
     }
+    bool hand_observer_ = false;
     std::string path_;
     std::mutex poses_mutex_;
     std::deque<a081_tracking_packet> poses_;
