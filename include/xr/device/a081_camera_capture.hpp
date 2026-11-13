@@ -159,8 +159,9 @@ public:
         if (converted && !ae_gate_file_.empty() && ::access(ae_gate_file_.c_str(), F_OK) == 0)
             ++ae_gate_frames_;
         const bool snapshot = converted && !saved_ && !output.empty() &&
+            ((!ae_gate_file_.empty()) || (xr_recording_enabled() && xr_recording_room(output.c_str()))) &&
             (ae_gate_file_.empty() || ae_gate_frames_ > 30);
-        if (snapshot) raw.assign(pixels, pixels + plane.bytesused - plane.data_offset);
+        if (snapshot && ae_gate_file_.empty()) raw.assign(pixels, pixels + plane.bytesused - plane.data_offset);
         // Copy before returning ownership to DMA; never read queued mappings.
         v4l2_plane queued_plane{};
         queued_plane.length = static_cast<__u32>(mapping.length);
@@ -185,8 +186,8 @@ public:
         // remains available; keep every error and slow dequeue in text too.
         const bool delayed = timestamp && receive_mono >= timestamp &&
                              receive_mono - timestamp >= 100000000ULL;
-        if (!sampled_text_ || frames <= 4 || !converted || !timestamp_ok || sequence_gap || delayed ||
-            receive_mono >= next_text_ns_) {
+        if (xr_diagnostic_logs_enabled() && (!sampled_text_ || frames <= 4 || !converted || !timestamp_ok || sequence_gap || delayed ||
+            receive_mono >= next_text_ns_)) {
         next_text_ns_ = receive_mono + 1000000000ULL;
         std::lock_guard<std::mutex> output_lock(output_mutex);
         std::cout << "stage=camera_frame node=" << std::quoted(node_) << " slot=" << slot
@@ -200,7 +201,7 @@ public:
         }
         if (snapshot) {
             const auto prefix = output + "/camera-slot" + std::to_string(slot) + "-first";
-            save_bytes(prefix + ".raw", raw);
+            if (ae_gate_file_.empty()) save_bytes(prefix + ".raw", raw);
             save_bytes(prefix + ".y8", y8);
             saved_ = true;
             std::lock_guard<std::mutex> output_lock(output_mutex);

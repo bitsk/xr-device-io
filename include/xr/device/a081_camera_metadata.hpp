@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include <xr/device/a081_recording.h>
 #include <xr/device/a081_camera_pixels.hpp>
 #include <xr/device/camera-preview.hpp>
 #include <xr/device/a081_camera_timing.hpp>
@@ -95,11 +96,8 @@ public:
             timing_ioctl(fd_, VIDIOC_QBUF, &b);
         }
         archive_path_ = output + "/camera-slot" + std::to_string(slot) + "-timing.bin";
-        const auto &path = archive_path_;
-        const char *continuous_value = std::getenv("A081_QVR_CONTINUOUS");
-        retain_segments_ = continuous_value && std::string(continuous_value) == "1";
-        archive_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-        if (archive_ < 0) throw std::runtime_error("Create QCFT raw record archive failed");
+        if (xr_recording_enabled() && xr_recording_room(output.c_str()))
+            archive_ = ::open(archive_path_.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
         std::lock_guard<std::mutex> log(output_mutex);
         std::cout << "stage=camera_timing_format slot=" << slot << " node=" << std::quoted(node_)
                   << " fourcc=QCFT bytes=216 version=2 buffers=" << request.count << std::endl;
@@ -127,27 +125,21 @@ public:
         timing_ioctl(fd_, VIDIOC_QBUF, &enqueue);
         if (out.version != QCOM_CAMSS_TIMING_VERSION || out.length != sizeof(out) || b.sequence != out.image_sequence)
             throw std::runtime_error("QCFT version/length/sequence mismatch");
-        constexpr std::uint64_t segment_limit = (8ULL * 1024 * 1024 / sizeof(Timing)) * sizeof(Timing);
-        if (retain_segments_ && archive_segment_bytes_ >= segment_limit) {
-            const int rc = ::close(archive_); archive_ = -1;
-            const auto retained = archive_path_ + (archive_segments_ ? ".previous" : ".first");
-            if (rc || ::rename(archive_path_.c_str(), retained.c_str()))
-                throw std::runtime_error("QCFT archive rotation failed");
-            archive_ = ::open(archive_path_.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-            if (archive_ < 0) throw std::runtime_error("Create QCFT next archive failed");
-            ++archive_segments_; archive_segment_bytes_ = 0;
-            std::lock_guard<std::mutex> log(output_mutex);
-            std::cout << "stage=camera_timing_archive_rotation node=" << std::quoted(node_)
-                      << " completed_segments=" << archive_segments_ << " records=" << archive_records_
-                      << " next_stream_id=" << out.stream_id << " next_sequence=" << out.image_sequence
-                      << " segment_limit=" << segment_limit << " retained=first+previous+current" << std::endl;
+        // A diagnostic archive stops at 8 MiB per camera or low free space;
+        // loss of optional storage must never stop live timing/pose delivery.
+        if (archive_ < 0) return true;
+        constexpr std::uint64_t segment_limit = 8ULL * 1024 * 1024;
+        if (archive_segment_bytes_ + sizeof(out) > segment_limit ||
+            (archive_records_ % 75 == 0 && !xr_recording_room(archive_path_.c_str()))) {
+            ::close(archive_); archive_ = -1;
+            return true;
         }
         const auto *bytes = reinterpret_cast<const std::uint8_t *>(&out);
         std::size_t offset = 0;
         while (offset < sizeof(out)) {
             const auto n = ::write(archive_, bytes + offset, sizeof(out) - offset);
             if (n < 0 && errno == EINTR) continue;
-            if (n <= 0) throw std::runtime_error("QCFT archive write failed");
+            if (n <= 0) { ::close(archive_); archive_ = -1; return true; }
             offset += static_cast<std::size_t>(n);
         }
         ++archive_records_; archive_segment_bytes_ += sizeof(out);
@@ -171,7 +163,7 @@ public:
             std::lock_guard<std::mutex> log(output_mutex);
             std::cout << "stage=camera_timing_archive_summary node=" << std::quoted(node_)
                       << " records=" << archive_records_ << " completed_segments=" << archive_segments_
-                      << " current_bytes=" << archive_segment_bytes_ << " bounded=" << retain_segments_ << std::endl;
+                      << " current_bytes=" << archive_segment_bytes_ << " bounded=1" << std::endl;
         }
         return ok;
     }
