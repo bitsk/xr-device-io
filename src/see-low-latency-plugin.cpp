@@ -75,7 +75,9 @@ int run() {
     if (lock<0 || flock(lock,LOCK_EX|LOCK_NB)) { if(lock>=0) close(lock); return 2; }
     int server=socket(AF_UNIX,SOCK_SEQPACKET|SOCK_CLOEXEC,0);
     sockaddr_un addr{}; addr.sun_family=AF_UNIX; std::strcpy(addr.sun_path,path);
-    auto oldmask=umask(0077);
+    // The session can observe the pathname immediately after bind. Create it
+    // as 0600 atomically instead of exposing a 0700 window before chmod.
+    auto oldmask=umask(0177);
     int rc=server<0 ? -1 : bind(server,reinterpret_cast<sockaddr *>(&addr),sizeof(addr));
     umask(oldmask);
     // Refuse an existing socket; never unlink another owner's endpoint.
