@@ -100,9 +100,12 @@ int run() {
         close(peer);close(server);unlink(path);close(lock);return 2;
     }
     std::uint32_t module=0, loader=0; char message[1024]{};
-    constexpr char uri[]="file:///libsns_low_lat_stream_skel.so?sns_low_lat_stream_skel_invoke&_dom=sdsp";
-    rc=remotectl_open(session,sizeof(uri),uri,&module,sizeof(message),message,&loader);
-    std::fprintf(stderr,"stage=see_open rc=%d loader=%u message=%s\n",rc,loader,message);
+    // The stock stub opens this name and retains the winning module handle
+    // for the process lifetime. Do not force a second, file-URI module.
+    constexpr char name[]="sns_low_lat_stream";
+    rc=remotectl_open(session,sizeof(name),name,&module,sizeof(message),message,&loader);
+    std::fprintf(stderr,"stage=see_open boottime_ns=%llu name=%s rc=%d loader=%u message=%s\n",
+        (unsigned long long)now(),name,rc,loader,message);
     if(rc || loader) { close(peer);close(server);unlink(path);close(lock);return 1; }
     std::uint64_t before[4]{}; a081_apps_mem_counters(before);
     xr::see::LowLatencyChannel accel(session,module),gyro(session,module);
@@ -110,10 +113,12 @@ int run() {
     constexpr unsigned period=1250;
     bool ok=true;
     for(unsigned i=0;i<2 && ok;++i) {
+        std::fprintf(stderr,"stage=see_init_begin boottime_ns=%llu kind=%u\n",(unsigned long long)now(),i);
         rc=channels[i]->initialize();
+        std::fprintf(stderr,"stage=see_init_end boottime_ns=%llu kind=%u rc=%d\n",(unsigned long long)now(),i,rc);
         if (!rc) rc=channels[i]->configure(ids[i],offset,i+1);
-        std::fprintf(stderr,"stage=see_config kind=%u period_us=%u rc=%d offset_ns=%lld uncertainty_ns=%llu\n",
-                     i,period,rc,(long long)offset,(unsigned long long)uncertainty);
+        std::fprintf(stderr,"stage=see_config boottime_ns=%llu kind=%u period_us=%u rc=%d offset_ns=%lld uncertainty_ns=%llu\n",
+                     (unsigned long long)now(),i,period,rc,(long long)offset,(unsigned long long)uncertainty);
         ok=rc==0;
     }
     std::atomic<bool> stopping{!ok}, failed{false}, disconnected{false};
@@ -122,17 +127,30 @@ int run() {
     std::thread workers[2];
     if(ok) for(unsigned i=0;i<2;++i) workers[i]=std::thread([&,i] {
         std::uint64_t last=0;
-        while(!stopping.load() && !disconnected.load()) {
+        bool first=true;
+        while(!stopping.load() && !disconnected.load() && !failed.load()) {
+            if(first) std::fprintf(stderr,"stage=see_poll_begin boottime_ns=%llu kind=%u\n",(unsigned long long)now(),i);
             int result=channels[i]->wait();
+            if(first || result) std::fprintf(stderr,"stage=see_poll_end boottime_ns=%llu kind=%u rc=%d stopping=%u\n",
+                (unsigned long long)now(),i,result,unsigned(stopping.load()));
             if(stopping.load() || interrupted) break;
             std::vector<xr::see::Event> events;
             if(!result) result=channels[i]->drain(events);
+            if(first) std::fprintf(stderr,"stage=see_first_drain boottime_ns=%llu kind=%u rc=%d events=%zu\n",
+                (unsigned long long)now(),i,result,events.size());
+            first=false;
             if(result) { std::fprintf(stderr,"stage=see_read kind=%u rc=%d\n",i,result);failed=true;break; }
             for(const auto &event:events) {
                 xr::see::Packet packet{};packet.kind=i;packet.arrival_boottime_ns=now();
                 packet.clock_uncertainty_ns=uncertainty;packet.requested_period_us=period;packet.event=event;
                 std::uint64_t stamp=0;float xyz[3];
-                if(!xr::see::decode(packet,i==1,stamp,xyz) || stamp<=last) { failed=true;break; }
+                if(!xr::see::decode(packet,i==1,stamp,xyz) || stamp<=last) {
+                    std::fprintf(stderr,"stage=see_decode_rejected kind=%u version=%u type=%u counter=%u stamp_ns=%llu arrival_ns=%llu uncertainty_ns=%llu previous_ns=%llu\n",
+                        i,xr::see::get32(event,0),xr::see::get32(event,8),xr::see::get32(event,12),
+                        (unsigned long long)xr::see::get64(event,16),(unsigned long long)packet.arrival_boottime_ns,
+                        (unsigned long long)uncertainty,(unsigned long long)last);
+                    failed=true;break;
+                }
                 last=stamp;
                 std::lock_guard<std::mutex> guard(output);
                 // A slow consumer fails explicitly; it never stalls sensor
@@ -158,16 +176,27 @@ int run() {
         auto current=now();
         for(unsigned i=0;i<2;++i) {
             auto last=received[i].load();
-            if(current>(last?last:start)+1000000000) { ok=false;break; }
+            if(current>(last?last:start)+1000000000) {
+                std::fprintf(stderr,"stage=see_timeout boottime_ns=%llu kind=%u last_ns=%llu\n",
+                    (unsigned long long)current,i,(unsigned long long)last);
+                ok=false;break;
+            }
         }
         // Suspend/resume or a changed counter relationship requires a new
         // session and offset. Do not retimestamp old samples to hide it.
         std::int64_t check;std::uint64_t bound;
-        if(!clock_offset(check,bound) || std::llabs(check-offset)>1000000) ok=false;
+        if(!clock_offset(check,bound) || std::llabs(check-offset)>1000000) {
+            std::fprintf(stderr,"stage=see_clock_changed boottime_ns=%llu\n",(unsigned long long)now());
+            ok=false;
+        }
     }
     stopping=true;
     bool stopped=true;
-    for(auto *channel:channels) { rc=channel->stop();stopped=rc==0 && stopped; }
+    for(unsigned i=0;i<2;++i) {
+        std::fprintf(stderr,"stage=see_stop_begin boottime_ns=%llu kind=%u\n",(unsigned long long)now(),i);
+        rc=channels[i]->stop();stopped=rc==0 && stopped;
+        std::fprintf(stderr,"stage=see_stop_end boottime_ns=%llu kind=%u rc=%d\n",(unsigned long long)now(),i,rc);
+    }
     if(!stopped) {
         std::fprintf(stderr,"stage=see_cleanup error=stop_failed_retain_until_session_exit\n");
         // The plugin is private to this listener process. Exit closes its
@@ -175,7 +204,12 @@ int run() {
         std::_Exit(1);
     }
     for(auto &worker:workers) if(worker.joinable()) worker.join();
-    for(auto *channel:channels) { rc=channel->deinitialize();ok=rc==0 && ok; }
+    std::fprintf(stderr,"stage=see_workers_joined boottime_ns=%llu\n",(unsigned long long)now());
+    for(unsigned i=0;i<2;++i) {
+        std::fprintf(stderr,"stage=see_deinit_begin boottime_ns=%llu kind=%u\n",(unsigned long long)now(),i);
+        rc=channels[i]->deinitialize();ok=rc==0 && ok;
+        std::fprintf(stderr,"stage=see_deinit_end boottime_ns=%llu kind=%u rc=%d\n",(unsigned long long)now(),i,rc);
+    }
     std::uint64_t after[4]{};a081_apps_mem_counters(after);
     bool balanced=after[2]==before[2] && after[3]==before[3] &&
         after[0]-before[0]==after[1]-before[1];
@@ -184,10 +218,14 @@ int run() {
         (unsigned long long)after[2],(unsigned long long)(after[3]-before[3]),
         (unsigned long long)gyro.skipped(),(unsigned long long)accel.skipped());
     if(!balanced) std::_Exit(1);
-    std::uint32_t close_error=0;
-    rc=remotectl_close(session,module,sizeof(message),message,&close_error);
+    // init registers a DSP process-local-storage destructor in this module.
+    // deinit stops streaming and unmaps memory but does not unregister that
+    // destructor. Keep its code loaded until FastRPC process teardown, as
+    // the stock stub does, instead of unloading it before PLS cleanup.
+    std::fprintf(stderr,"stage=see_session_release boottime_ns=%llu module=0x%08x ok=%u failed=%u disconnected=%u\n",
+        (unsigned long long)now(),module,unsigned(ok),unsigned(failed.load()),unsigned(disconnected.load()));
     close(peer);close(server);unlink(path);close(lock);
-    return ok && !failed.load() && !rc && !close_error ? 0 : 1;
+    return ok && !failed.load() ? 0 : 1;
 }
 }
 extern "C" int a081_qvr_client_main() { return run(); }

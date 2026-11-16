@@ -1,3 +1,10 @@
+xr-device-io (0.1.6) unstable; urgency=medium
+
+  * Match the stock SEE module name and process-scoped handle lifetime.
+  * Record first sample rejection metadata and bounded lifecycle diagnostics.
+
+ -- bits <bigbits@hackx.cc>  Tue, 17 Nov 2026 03:20:22 +0800
+
 xr-device-io (0.1.5) unstable; urgency=medium
 
   * Add the stock 800 Hz SEE direct producer, DMA lifecycle and sample contract.
