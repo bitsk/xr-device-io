@@ -270,10 +270,22 @@ inline int capture_live(const CaptureCallbacks *callbacks = nullptr)
 {
     const char *nodes = std::getenv("A081_QVR_CAMERA_NODES");
     const char *output = std::getenv("A081_QVR_OUTPUT_DIR");
+    const char *device_option = std::getenv("XR_DEVICE");
+    const std::string device = device_option ? device_option : "a081";
     std::ifstream model_file("/proc/device-tree/model", std::ios::binary);
-    const std::string model((std::istreambuf_iterator<char>(model_file)), {});
-    if (model.find("A081") == std::string::npos || !nodes || !output || output[0] != '/') {
-        std::cerr << "Requires A081, configured A081_QVR_CAMERA_NODES and a fresh A081_QVR_OUTPUT_DIR\n";
+    std::string model;
+    std::getline(model_file, model, '\0');
+    bool identity_matches = device == "a081" && model.find("A081") != std::string::npos;
+    if (device == "vr700" && model == "iQIYI VR700 / Qiyu DREAM Pro") {
+        // Selection alone cannot authorize capture on another board. Compare
+        // complete NUL-separated compatible tokens from the running DT.
+        std::ifstream compatible_file("/proc/device-tree/compatible", std::ios::binary);
+        std::string token;
+        while (std::getline(compatible_file, token, '\0'))
+            if (token == "iqiyi,vr700") identity_matches = true;
+    }
+    if (!identity_matches || !nodes || !output || output[0] != '/') {
+        std::cerr << "Requires XR_DEVICE matching the running device tree, configured A081_QVR_CAMERA_NODES and a fresh A081_QVR_OUTPUT_DIR\n";
         return 2;
     }
     int lock = -1;
@@ -354,7 +366,7 @@ inline int capture_live(const CaptureCallbacks *callbacks = nullptr)
             }
         }
         if (const char *timing_nodes = std::getenv("A081_QVR_CAMERA_TIMING_NODES")) {
-            if (cameras.size() != 4) throw std::runtime_error("QCFT mode requires the validated four-slot A081 graph");
+            if (cameras.size() != 4) throw std::runtime_error("QCFT mode requires the configured four-slot camera graph");
             const char *exposure = std::getenv("A081_QVR_CAMERA_EXPOSURE_NS");
             char *end = nullptr;
             errno = 0;
