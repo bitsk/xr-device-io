@@ -32,19 +32,37 @@ std::uint32_t get32(const Event &e, std::size_t n) {
 std::uint64_t get64(const Event &e, std::size_t n) {
     return get32(e,n) | std::uint64_t(get32(e,n+4))<<32;
 }
+std::uint64_t mapping_uncertainty(std::uint64_t age, std::uint64_t anchor_uncertainty) {
+    return anchor_uncertainty + static_cast<std::uint64_t>(
+        (static_cast<unsigned __int128>(age)*clock_rate_bound_ppb+999999999)/1000000000);
+}
 bool decode(const Packet &p, bool gyro, std::uint64_t &time, float xyz[3]) {
     const auto &e = p.event;
     // Flags 2 request Android uncalibrated samples. Do not silently accept a
     // calibrated source or subtract the bias fields a second time.
     if (p.magic != packet_magic || p.kind != unsigned(gyro) || get32(e,0) != event_bytes ||
         get32(e,8) != (gyro ? 16u : 35u) || !get32(e,12) ||
-        !p.arrival_boottime_ns || p.clock_uncertainty_ns > 1000000 || p.reserved ||
+        !p.arrival_boottime_ns || !p.clock_anchor_qtimer_ns || p.reserved ||
+        p.clock_anchor_uncertainty_ns < 2*qtimer_tick_ns ||
+        p.clock_anchor_uncertainty_ns > 500000+2*qtimer_tick_ns ||
+        p.clock_rate_bound_ppb != clock_rate_bound_ppb ||
         p.requested_period_us!=1250) return false;
     const auto raw_stamp = get64(e,16);
+    // A stable record was copied before this batch's fresh counter anchor.
+    // Reject future raw events using counter causality, independently of the
+    // deliberately conservative historical conversion uncertainty.
+    if (raw_stamp > p.clock_anchor_qtimer_ns &&
+        raw_stamp-p.clock_anchor_qtimer_ns > qtimer_tick_ns) return false;
+    const auto age = raw_stamp>p.clock_anchor_qtimer_ns ? raw_stamp-p.clock_anchor_qtimer_ns :
+                     p.clock_anchor_qtimer_ns-raw_stamp;
+    if (age>1000000000 || p.clock_uncertainty_ns != mapping_uncertainty(age,p.clock_anchor_uncertainty_ns))
+        return false;
+    const __int128 anchor_boot = static_cast<__int128>(p.clock_anchor_qtimer_ns)+p.qtimer_to_boottime_ns;
+    if (anchor_boot<=0 || anchor_boot>p.arrival_boottime_ns) return false;
     const __int128 converted = static_cast<__int128>(raw_stamp) + p.qtimer_to_boottime_ns;
     if (!raw_stamp || converted<=0 || converted>UINT64_MAX) return false;
     const auto stamp = static_cast<std::uint64_t>(converted);
-    if ((stamp > p.arrival_boottime_ns && stamp-p.arrival_boottime_ns > p.clock_uncertainty_ns) ||
+    if ((stamp > p.arrival_boottime_ns && stamp-p.arrival_boottime_ns > qtimer_tick_ns) ||
         (stamp < p.arrival_boottime_ns && p.arrival_boottime_ns-stamp > 1000000000)) return false;
     float values[3];
     for (unsigned i=0; i<3; ++i) {

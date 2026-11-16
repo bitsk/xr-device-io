@@ -16,18 +16,26 @@ using Event = std::array<std::uint8_t, event_bytes>;
 // The event timestamp remains QTimer nanoseconds. The measured signed offset
 // converts it to BOOTTIME in decode(), never from first-arrival time. DSP
 // configuration uses zero offset so this is the sole clock conversion.
-constexpr std::uint32_t packet_magic = 0x324c5358; // XSL2
+// Linux PLL phase: MAXPHASE / 2^SHIFT_PLL = 125 ms/s; frequency and
+// adjtime each add at most 0.5 ms/s. The producer gates nominal tick, no PPS
+// and no boot ntp_tick_adj. This is a model bound, not measured clock noise.
+constexpr std::uint64_t clock_rate_bound_ppb = 126000000;
+constexpr std::uint64_t qtimer_tick_ns = 53; // ceil(1e9 / 19200000)
+constexpr std::uint32_t packet_magic = 0x334c5358; // XSL3
 struct Packet {
     std::uint32_t magic = packet_magic, kind{}; // 0 accel, 1 gyro
     std::uint64_t arrival_boottime_ns{}, clock_uncertainty_ns{};
     std::uint32_t requested_period_us{}, reserved{};
     std::int64_t qtimer_to_boottime_ns{};
+    std::uint64_t clock_anchor_qtimer_ns{}, clock_anchor_uncertainty_ns{};
+    std::uint64_t clock_rate_bound_ppb = xr::see::clock_rate_bound_ppb;
     Event event{};
 };
-static_assert(sizeof(Packet) == 144 && offsetof(Packet, event) == 40);
+static_assert(sizeof(Packet) == 168 && offsetof(Packet, event) == 64);
 
 std::uint32_t get32(const Event &, std::size_t);
 std::uint64_t get64(const Event &, std::size_t);
+std::uint64_t mapping_uncertainty(std::uint64_t age_ns, std::uint64_t anchor_uncertainty_ns);
 bool decode(const Packet &, bool gyro, std::uint64_t &time_ns, float xyz[3]);
 
 // Borrow an already initialized SDSP session and a module opened by its

@@ -8,6 +8,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <mutex>
+#include <fstream>
+#include <string>
 #include <poll.h>
 #include <pthread.h>
 #include <sys/file.h>
@@ -15,6 +17,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/timex.h>
 #include <thread>
 #include <time.h>
 #include <unistd.h>
@@ -48,9 +51,27 @@ std::uint64_t now() {
     timespec t{}; if (clock_gettime(CLOCK_BOOTTIME,&t)) return 0;
     return std::uint64_t(t.tv_sec)*1000000000+t.tv_nsec;
 }
-bool clock_offset(std::int64_t &offset,std::uint64_t &uncertainty) {
+struct ClockAnchor {
+    std::int64_t offset{};
+    std::uint64_t qtimer{}, uncertainty{};
+};
+bool clock_policy() {
+    std::ifstream source("/sys/devices/system/clocksource/clocksource0/current_clocksource");
+    std::string name; source>>name;
+    std::ifstream command("/proc/cmdline");std::string argument;
+    if(name!="arch_sys_counter" || !command) return false;
+    while(command>>argument) if(argument.rfind("ntp_tick_adj=",0)==0 && argument!="ntp_tick_adj=0") return false;
+    return true;
+}
+bool clock_anchor(ClockAnchor &anchor) {
 #if defined(__aarch64__)
-    std::uint64_t best=UINT64_MAX, value=0;
+    // Read-only. MAXPHASE, SHIFT_PLL and MAX_TICKADJ bound all PLL time
+    // constants, frequency changes and adjtime corrections. Unsupported tick
+    // or PPS discipline must not silently invalidate that bound.
+    timex discipline{};
+    if(adjtimex(&discipline)<0 || discipline.tick!=10000 || sysconf(_SC_CLK_TCK)!=100 ||
+       (discipline.status&STA_PPSTIME)) return false;
+    std::uint64_t best=UINT64_MAX;
     for (unsigned i=0;i<8;++i) {
         auto before=now(); std::uint64_t ticks,freq;
         asm volatile("isb; mrs %0, cntvct_el0; mrs %1, cntfrq_el0" : "=r"(ticks),"=r"(freq) :: "memory");
@@ -58,12 +79,18 @@ bool clock_offset(std::int64_t &offset,std::uint64_t &uncertainty) {
         if (!before || after<before || freq!=19200000) return false;
         auto span=after-before;
         auto ns=static_cast<std::uint64_t>((static_cast<unsigned __int128>(ticks)*1000000000)/freq);
-        if (span<best) { best=span; value=before+span/2-ns; }
+        if (span<best) {
+            const __int128 offset=static_cast<__int128>(before)+span/2-ns;
+            if(offset<INT64_MIN || offset>INT64_MAX) return false;
+            best=span;anchor.offset=static_cast<std::int64_t>(offset);anchor.qtimer=ns;
+        }
     }
     if (best>1000000) return false;
-    offset=static_cast<std::int64_t>(value); uncertainty=best/2+53; return true;
+    // Two counter quanta cover counter conversion plus the 19.2 MHz
+    // clocksource multiplier rounding over the accepted <=1 s record age.
+    anchor.uncertainty=(best+1)/2+2*xr::see::qtimer_tick_ns;return true;
 #else
-    (void)offset; (void)uncertainty; return false;
+    (void)anchor;return false;
 #endif
 }
 bool suid(const char *name,xr::see::Suid &id) {
@@ -91,8 +118,6 @@ int run() {
         (ids[0].low==ids[1].low && ids[0].high==ids[1].high)) {
         std::fprintf(stderr,"stage=see_gate error=explicit_session_socket_suids_required\n"); return 2;
     }
-    std::int64_t offset{}; std::uint64_t uncertainty{};
-    if (!clock_offset(offset,uncertainty)) return 2;
     // Same lock as the existing IIO producer. The tracker socket consumer must
     // not open or configure IIO, so only this process owns the selected source.
     int lock=open("/run/a081-iio.lock",O_RDWR|O_CREAT|O_CLOEXEC|O_NOFOLLOW,0600);
@@ -121,6 +146,13 @@ int run() {
     if (getsockopt(peer,SOL_SOCKET,SO_PEERCRED,&credentials,&clen) || credentials.uid!=geteuid()) {
         close(peer);close(server);unlink(path);close(lock);return 2;
     }
+    ClockAnchor initial;
+    // Camera/SDK startup may precede this connection by many seconds. Never
+    // calibrate a session before its consumer handshake.
+    if(!clock_policy() || !clock_anchor(initial)) {
+        std::fprintf(stderr,"stage=see_clock error=unsupported_clock_discipline\n");
+        close(peer);close(server);unlink(path);close(lock);return 2;
+    }
     std::uint32_t module=0, loader=0; char message[1024]{};
     // The stock stub opens this name and retains the winning module handle
     // for the process lifetime. Do not force a second, file-URI module.
@@ -140,7 +172,7 @@ int run() {
         std::fprintf(stderr,"stage=see_init_end boottime_ns=%llu kind=%u rc=%d\n",(unsigned long long)now(),i,rc);
         if (!rc) rc=channels[i]->configure(ids[i],i+1);
         std::fprintf(stderr,"stage=see_config boottime_ns=%llu kind=%u period_us=%u rc=%d dsp_offset_ns=0 qtimer_to_boottime_ns=%lld uncertainty_ns=%llu\n",
-                     (unsigned long long)now(),i,period,rc,(long long)offset,(unsigned long long)uncertainty);
+                     (unsigned long long)now(),i,period,rc,(long long)initial.offset,(unsigned long long)initial.uncertainty);
         ok=rc==0;
     }
     std::atomic<bool> stopping{!ok}, failed{false}, disconnected{false};
@@ -148,7 +180,8 @@ int run() {
     std::mutex output;
     std::thread workers[2];
     if(ok) for(unsigned i=0;i<2;++i) workers[i]=std::thread([&,i] {
-        std::uint64_t last=0;
+        std::uint64_t last=0,last_raw=0,max_age=0,max_uncertainty=0;
+        ClockAnchor previous=initial;
         bool first=true;
         while(!stopping.load() && !disconnected.load() && !failed.load()) {
             if(first) std::fprintf(stderr,"stage=see_poll_begin boottime_ns=%llu kind=%u\n",(unsigned long long)now(),i);
@@ -162,19 +195,38 @@ int run() {
                 (unsigned long long)now(),i,result,events.size());
             first=false;
             if(result) { std::fprintf(stderr,"stage=see_read kind=%u rc=%d\n",i,result);failed=true;break; }
+            if(events.empty()) continue;
+            ClockAnchor anchor;
+            if(!clock_anchor(anchor) || anchor.qtimer<=previous.qtimer) {
+                std::fprintf(stderr,"stage=see_clock error=anchor_failed kind=%u\n",i);failed=true;break;
+            }
+            const auto elapsed=anchor.qtimer-previous.qtimer;
+            const __int128 drift=static_cast<__int128>(anchor.offset)-previous.offset;
+            const auto bound=xr::see::mapping_uncertainty(elapsed,anchor.uncertainty+previous.uncertainty);
+            if(drift>bound || drift<-static_cast<__int128>(bound)) {
+                std::fprintf(stderr,"stage=see_clock error=discontinuity kind=%u\n",i);failed=true;break;
+            }
+            previous=anchor;
             for(const auto &event:events) {
                 xr::see::Packet packet{};packet.kind=i;packet.arrival_boottime_ns=now();
-                packet.clock_uncertainty_ns=uncertainty;packet.qtimer_to_boottime_ns=offset;
+                packet.clock_anchor_qtimer_ns=anchor.qtimer;
+                packet.clock_anchor_uncertainty_ns=anchor.uncertainty;
+                packet.qtimer_to_boottime_ns=anchor.offset;
+                const auto raw=xr::see::get64(event,16);
+                const auto age=anchor.qtimer>raw ? anchor.qtimer-raw : raw-anchor.qtimer;
+                packet.clock_uncertainty_ns=xr::see::mapping_uncertainty(age,anchor.uncertainty);
                 packet.requested_period_us=period;packet.event=event;
                 std::uint64_t stamp=0;float xyz[3];
-                if(!xr::see::decode(packet,i==1,stamp,xyz) || stamp<=last) {
-                    std::fprintf(stderr,"stage=see_decode_rejected kind=%u version=%u type=%u counter=%u raw_qtimer_ns=%llu arrival_ns=%llu uncertainty_ns=%llu previous_ns=%llu qtimer_to_boottime_ns=%lld\n",
+                if(!xr::see::decode(packet,i==1,stamp,xyz) || stamp<=last || raw<=last_raw) {
+                    std::fprintf(stderr,"stage=see_decode_rejected kind=%u version=%u type=%u counter=%u raw_qtimer_ns=%llu arrival_ns=%llu uncertainty_ns=%llu previous_ns=%llu qtimer_to_boottime_ns=%lld anchor_qtimer_ns=%llu anchor_uncertainty_ns=%llu anchor_age_ns=%llu\n",
                         i,xr::see::get32(event,0),xr::see::get32(event,8),xr::see::get32(event,12),
                         (unsigned long long)xr::see::get64(event,16),(unsigned long long)packet.arrival_boottime_ns,
-                        (unsigned long long)uncertainty,(unsigned long long)last,(long long)offset);
+                        (unsigned long long)packet.clock_uncertainty_ns,(unsigned long long)last,(long long)anchor.offset,
+                        (unsigned long long)anchor.qtimer,(unsigned long long)anchor.uncertainty,(unsigned long long)age);
                     failed=true;break;
                 }
-                last=stamp;
+                last=stamp;last_raw=raw;
+                max_age=std::max(max_age,age);max_uncertainty=std::max(max_uncertainty,packet.clock_uncertainty_ns);
                 std::lock_guard<std::mutex> guard(output);
                 // A slow consumer fails explicitly; it never stalls sensor
                 // acquisition behind an unbounded queue or fabricates samples.
@@ -185,6 +237,8 @@ int run() {
                 received[i]=packet.arrival_boottime_ns;
             }
         }
+        std::fprintf(stderr,"stage=see_clock_summary kind=%u max_anchor_age_ns=%llu max_model_uncertainty_ns=%llu rate_bound_ppb=%llu\n",
+            i,(unsigned long long)max_age,(unsigned long long)max_uncertainty,(unsigned long long)xr::see::clock_rate_bound_ppb);
     });
     auto start=now();
     while(ok && !interrupted && !failed.load() && !disconnected.load()) {
@@ -205,13 +259,6 @@ int run() {
                     (unsigned long long)current,i,(unsigned long long)last);
                 ok=false;break;
             }
-        }
-        // Suspend/resume or a changed counter relationship requires a new
-        // session and offset. Do not retimestamp old samples to hide it.
-        std::int64_t check;std::uint64_t bound;
-        if(!clock_offset(check,bound) || std::llabs(check-offset)>1000000) {
-            std::fprintf(stderr,"stage=see_clock_changed boottime_ns=%llu\n",(unsigned long long)now());
-            ok=false;
         }
     }
     stopping=true;
