@@ -13,15 +13,18 @@ using Event = std::array<std::uint8_t, event_bytes>;
 
 // Local SOCK_SEQPACKET contract. Event retains the complete Android direct
 // record, including its producer counter, original timestamp and bias fields.
-// The timestamp offset is measured against BOOTTIME, never first-arrival time.
-constexpr std::uint32_t packet_magic = 0x314c5358; // XSL1
+// The event timestamp remains QTimer nanoseconds. The measured signed offset
+// converts it to BOOTTIME in decode(), never from first-arrival time. DSP
+// configuration uses zero offset so this is the sole clock conversion.
+constexpr std::uint32_t packet_magic = 0x324c5358; // XSL2
 struct Packet {
     std::uint32_t magic = packet_magic, kind{}; // 0 accel, 1 gyro
     std::uint64_t arrival_boottime_ns{}, clock_uncertainty_ns{};
     std::uint32_t requested_period_us{}, reserved{};
+    std::int64_t qtimer_to_boottime_ns{};
     Event event{};
 };
-static_assert(sizeof(Packet) == 136 && offsetof(Packet, event) == 32);
+static_assert(sizeof(Packet) == 144 && offsetof(Packet, event) == 40);
 
 std::uint32_t get32(const Event &, std::size_t);
 std::uint64_t get64(const Event &, std::size_t);
@@ -37,7 +40,7 @@ public:
     LowLatencyChannel(const LowLatencyChannel &) = delete;
     LowLatencyChannel &operator=(const LowLatencyChannel &) = delete;
     int initialize();
-    int configure(Suid, std::int64_t boot_offset_ns, int sensor_handle);
+    int configure(Suid, int sensor_handle);
     int wait(); // synchronous DSP sns_llcm_poll notification; no polling timer
     int drain(std::vector<Event> &);
     int stop();

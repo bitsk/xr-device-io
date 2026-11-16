@@ -40,8 +40,11 @@ bool decode(const Packet &p, bool gyro, std::uint64_t &time, float xyz[3]) {
         get32(e,8) != (gyro ? 16u : 35u) || !get32(e,12) ||
         !p.arrival_boottime_ns || p.clock_uncertainty_ns > 1000000 || p.reserved ||
         p.requested_period_us!=1250) return false;
-    const auto stamp = get64(e,16);
-    if (!stamp || stamp > p.arrival_boottime_ns + p.clock_uncertainty_ns ||
+    const auto raw_stamp = get64(e,16);
+    const __int128 converted = static_cast<__int128>(raw_stamp) + p.qtimer_to_boottime_ns;
+    if (!raw_stamp || converted<=0 || converted>UINT64_MAX) return false;
+    const auto stamp = static_cast<std::uint64_t>(converted);
+    if ((stamp > p.arrival_boottime_ns && stamp-p.arrival_boottime_ns > p.clock_uncertainty_ns) ||
         (stamp < p.arrival_boottime_ns && p.arrival_boottime_ns-stamp > 1000000000)) return false;
     float values[3];
     for (unsigned i=0; i<3; ++i) {
@@ -87,13 +90,17 @@ int LowLatencyChannel::initialize() {
     if (!channel_) return -EPROTO;
     initialized_=true; return 0;
 }
-int LowLatencyChannel::configure(Suid id, std::int64_t offset, int handle) {
+int LowLatencyChannel::configure(Suid id, int handle) {
     if (!initialized_ || needs_stop_) return -EINVAL;
     // Stock QVR requests VERY_FAST: the verified HAL table selects 1250us.
     // The configuration default and advertised extra rates do not override it.
     if ((!id.low && !id.high) || handle<=0) return -EINVAL;
     std::uint8_t input[48]{};
-    put32(input,0,channel_); put64(input,8,offset);
+    // Keep the shared record in QTimer nanoseconds. The original HAL passes
+    // an elapsedRealtime offset here, but this firmware was observed to leave
+    // the record unconverted. Zero prevents a second, DSP-side conversion;
+    // Packet carries our measured offset for the single AP-side conversion.
+    put32(input,0,channel_); put64(input,8,0);
     put64(input,16,id.low); put64(input,24,id.high);
     put32(input,32,1250); put32(input,36,2); put32(input,40,handle);
     needs_stop_=true;

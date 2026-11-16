@@ -116,8 +116,8 @@ int run() {
         std::fprintf(stderr,"stage=see_init_begin boottime_ns=%llu kind=%u\n",(unsigned long long)now(),i);
         rc=channels[i]->initialize();
         std::fprintf(stderr,"stage=see_init_end boottime_ns=%llu kind=%u rc=%d\n",(unsigned long long)now(),i,rc);
-        if (!rc) rc=channels[i]->configure(ids[i],offset,i+1);
-        std::fprintf(stderr,"stage=see_config boottime_ns=%llu kind=%u period_us=%u rc=%d offset_ns=%lld uncertainty_ns=%llu\n",
+        if (!rc) rc=channels[i]->configure(ids[i],i+1);
+        std::fprintf(stderr,"stage=see_config boottime_ns=%llu kind=%u period_us=%u rc=%d dsp_offset_ns=0 qtimer_to_boottime_ns=%lld uncertainty_ns=%llu\n",
                      (unsigned long long)now(),i,period,rc,(long long)offset,(unsigned long long)uncertainty);
         ok=rc==0;
     }
@@ -142,13 +142,14 @@ int run() {
             if(result) { std::fprintf(stderr,"stage=see_read kind=%u rc=%d\n",i,result);failed=true;break; }
             for(const auto &event:events) {
                 xr::see::Packet packet{};packet.kind=i;packet.arrival_boottime_ns=now();
-                packet.clock_uncertainty_ns=uncertainty;packet.requested_period_us=period;packet.event=event;
+                packet.clock_uncertainty_ns=uncertainty;packet.qtimer_to_boottime_ns=offset;
+                packet.requested_period_us=period;packet.event=event;
                 std::uint64_t stamp=0;float xyz[3];
                 if(!xr::see::decode(packet,i==1,stamp,xyz) || stamp<=last) {
-                    std::fprintf(stderr,"stage=see_decode_rejected kind=%u version=%u type=%u counter=%u stamp_ns=%llu arrival_ns=%llu uncertainty_ns=%llu previous_ns=%llu\n",
+                    std::fprintf(stderr,"stage=see_decode_rejected kind=%u version=%u type=%u counter=%u raw_qtimer_ns=%llu arrival_ns=%llu uncertainty_ns=%llu previous_ns=%llu qtimer_to_boottime_ns=%lld\n",
                         i,xr::see::get32(event,0),xr::see::get32(event,8),xr::see::get32(event,12),
                         (unsigned long long)xr::see::get64(event,16),(unsigned long long)packet.arrival_boottime_ns,
-                        (unsigned long long)uncertainty,(unsigned long long)last);
+                        (unsigned long long)uncertainty,(unsigned long long)last,(long long)offset);
                     failed=true;break;
                 }
                 last=stamp;

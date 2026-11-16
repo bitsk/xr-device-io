@@ -1,3 +1,10 @@
+xr-device-io (0.1.7) unstable; urgency=medium
+
+  * Preserve raw SEE timestamps and explicitly convert QTimer to BOOTTIME once.
+  * Version the direct packet contract with its measured signed clock offset.
+
+ -- bits <bigbits@hackx.cc>  Tue, 17 Nov 2026 03:24:35 +0800
+
 xr-device-io (0.1.6) unstable; urgency=medium
 
   * Match the stock SEE module name and process-scoped handle lifetime.

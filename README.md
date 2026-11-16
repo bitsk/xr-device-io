@@ -16,7 +16,10 @@ VERY_FAST 请求及传感器 HAL 的周期表；配置中的频率声明和 SEE 
 
 保留原厂 104 字节记录及计数器、时间戳和 bias 字段，通过
 `sns_low_lat_stream_poll` 等待固件通知，禁止定时生成替代样本。
-QTimer 与 BOOTTIME 的偏移用计数器夹取测量；挂起造成的时钟跳变结束会话。
+XSL2 包为 144 字节，包含完整原始记录和显式有符号 `qtimer_to_boottime_ns`。
+QTimer 与 BOOTTIME 的偏移用计数器夹取测量；DSP 配置偏移固定为零，
+统一 `decode()` 只做一次原始 QTimer 纳秒到 BOOTTIME 的转换，不修改原始记录。
+挂起造成的时钟跳变结束会话，未来时间和顺序检查继续生效。
 不再对未校准三轴值重复扣 bias，也不二次旋转 Android 坐标。
 结束时先 stop 唤醒等待者，随后 join、deinit/unmap 和关闭独立 SDSP 会话。
 通知、缓存可见性、真实频率和退出后的 DMA 回收仍需在目标硬件验证。
