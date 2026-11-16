@@ -79,7 +79,10 @@ int run() {
     int rc=server<0 ? -1 : bind(server,reinterpret_cast<sockaddr *>(&addr),sizeof(addr));
     umask(oldmask);
     // Refuse an existing socket; never unlink another owner's endpoint.
-    if (rc || listen(server,1)) { if(server>=0)close(server);close(lock);return 2; }
+    if (rc) { if(server>=0)close(server);close(lock);return 2; }
+    if (chmod(path,0600) || listen(server,1)) {
+        close(server);unlink(path);close(lock);return 2;
+    }
     struct sigaction action{}; action.sa_handler=interrupt; action.sa_flags=SA_RESTART;
     sigemptyset(&action.sa_mask);
     sigaction(SIGTERM,&action,nullptr); sigaction(SIGINT,&action,nullptr);
