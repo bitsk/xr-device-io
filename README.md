@@ -2,6 +2,25 @@
 
 共享相机/IMU、原始手柄传输、时间戳和缓冲所有权。
 
+IMU 使用原厂 SEE direct 路径：两个共享 DMA 通道、1250 微秒请求周期
+（名义 800 Hz）、Android 未校准加速度/陀螺仪事件。这个周期来自 QVR 的
+VERY_FAST 请求及传感器 HAL 的周期表；配置中的频率声明和 SEE 能力表不替代它。
+实际频率必须用返回样本的时间戳统计，构建成功不代表采样或通知已实机通过。
+
+`libxr-see-low-latency.so` 作为 `xr-hexagonrpcd -s -d slpi -P` 的私有插件运行。
+会话管理器传入已发现的 `XR_SEE_ACCEL_SUID`、`XR_SEE_GYRO_SUID`
+（各为小端 UID 两个整数的 `16位十六进制:16位十六进制` 文本），
+`XR_SEE_IMU_SOCKET` 和显式启动确认 `XR_SEE_LOW_LATENCY=1`。
+插件与已有 IMU 所有权锁互斥，只向同 UID 的一个 head 消费者发送记录；
+安装不会自动启动它。FastRPC listener 和固件由会话管理器提供。
+
+保留原厂 104 字节记录及计数器、时间戳和 bias 字段，通过
+`sns_low_lat_stream_poll` 等待固件通知，禁止定时生成替代样本。
+QTimer 与 BOOTTIME 的偏移用计数器夹取测量；挂起造成的时钟跳变结束会话。
+不再对未校准三轴值重复扣 bias，也不二次旋转 Android 坐标。
+结束时先 stop 唤醒等待者，随后 join、deinit/unmap 和关闭独立 SDSP 会话。
+通知、缓存可见性、真实频率和退出后的 DMA 回收仍需在目标硬件验证。
+
 
 构建入口和依赖见下方；工程 Wiki/Blog 与跨仓库规划集中在 [openkylin-xr-docs](https://github.com/bitsk/openkylin-xr-docs)。
 
