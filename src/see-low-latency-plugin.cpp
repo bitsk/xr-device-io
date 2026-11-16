@@ -9,7 +9,9 @@
 #include <fcntl.h>
 #include <mutex>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/file.h>
+#include <sys/signalfd.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -23,8 +25,25 @@ void a081_apps_mem_counters(std::uint64_t out[4]) __attribute__((weak));
 }
 
 namespace {
-volatile sig_atomic_t interrupted;
-void interrupt(int) { interrupted=1; }
+struct TerminationSignals {
+    int fd=-1;
+    ~TerminationSignals() { if(fd>=0) close(fd); }
+    bool initialize() {
+        sigset_t current, watched;
+        // Refuse an old daemon instead of leaving its listener interruptible.
+        if(pthread_sigmask(SIG_SETMASK,nullptr,&current) ||
+           sigismember(&current,SIGTERM)!=1 || sigismember(&current,SIGINT)!=1) return false;
+        sigemptyset(&watched);sigaddset(&watched,SIGTERM);sigaddset(&watched,SIGINT);
+        fd=signalfd(-1,&watched,SFD_CLOEXEC|SFD_NONBLOCK);
+        return fd>=0;
+    }
+    bool consume() {
+        signalfd_siginfo info{};
+        if(read(fd,&info,sizeof(info))!=sizeof(info)) return false;
+        std::fprintf(stderr,"stage=see_termination signal=%u\n",info.ssi_signo);
+        return info.ssi_signo==SIGTERM || info.ssi_signo==SIGINT;
+    }
+};
 std::uint64_t now() {
     timespec t{}; if (clock_gettime(CLOCK_BOOTTIME,&t)) return 0;
     return std::uint64_t(t.tv_sec)*1000000000+t.tv_nsec;
@@ -57,6 +76,11 @@ bool suid(const char *name,xr::see::Suid &id) {
     return !errno && !*end && (id.low || id.high);
 }
 int run() {
+    TerminationSignals termination;
+    if(!termination.initialize()) {
+        std::fprintf(stderr,"stage=see_gate error=synchronous_signal_daemon_required\n");return 2;
+    }
+    bool interrupted=false;
     int session=hexagonrpc_fd_from_env();
     xr::see::Suid ids[2]{};
     const char *path=getenv("XR_SEE_IMU_SOCKET");
@@ -85,14 +109,12 @@ int run() {
     if (chmod(path,0600) || listen(server,1)) {
         close(server);unlink(path);close(lock);return 2;
     }
-    struct sigaction action{}; action.sa_handler=interrupt; action.sa_flags=SA_RESTART;
-    sigemptyset(&action.sa_mask);
-    sigaction(SIGTERM,&action,nullptr); sigaction(SIGINT,&action,nullptr);
     int peer=-1;
     while (!interrupted) {
-        pollfd p{server,POLLIN,0}; rc=poll(&p,1,100);
+        pollfd p[]{{server,POLLIN,0},{termination.fd,POLLIN,0}};rc=poll(p,2,100);
         if (rc<0 && errno!=EINTR) break;
-        if (rc>0) { peer=accept4(server,nullptr,nullptr,SOCK_CLOEXEC|SOCK_NONBLOCK); break; }
+        if(p[1].revents) { interrupted=termination.consume();break; }
+        if(p[0].revents) { peer=accept4(server,nullptr,nullptr,SOCK_CLOEXEC|SOCK_NONBLOCK);break; }
     }
     if(peer<0) { close(server);unlink(path);close(lock);return interrupted ? 0 : 1; }
     ucred credentials{}; socklen_t clen=sizeof(credentials);
@@ -133,7 +155,7 @@ int run() {
             int result=channels[i]->wait();
             if(first || result) std::fprintf(stderr,"stage=see_poll_end boottime_ns=%llu kind=%u rc=%d stopping=%u\n",
                 (unsigned long long)now(),i,result,unsigned(stopping.load()));
-            if(stopping.load() || interrupted) break;
+            if(stopping.load()) break;
             std::vector<xr::see::Event> events;
             if(!result) result=channels[i]->drain(events);
             if(first) std::fprintf(stderr,"stage=see_first_drain boottime_ns=%llu kind=%u rc=%d events=%zu\n",
@@ -166,9 +188,10 @@ int run() {
     });
     auto start=now();
     while(ok && !interrupted && !failed.load() && !disconnected.load()) {
-        pollfd p{peer,POLLIN,0};rc=poll(&p,1,100);
+        pollfd p[]{{peer,POLLIN,0},{termination.fd,POLLIN,0}};rc=poll(p,2,100);
         if(rc<0 && errno!=EINTR) { ok=false;break; }
-        if(rc>0) {
+        if(p[1].revents) { interrupted=termination.consume();ok=interrupted;break; }
+        if(p[0].revents) {
             char byte;
             auto n=recv(peer,&byte,1,MSG_DONTWAIT|MSG_PEEK);
             if(n==0 || (n<0 && errno==ECONNRESET)) disconnected=true; else ok=false;
@@ -229,4 +252,5 @@ int run() {
     return ok && !failed.load() ? 0 : 1;
 }
 }
+extern "C" int a081_qvr_client_synchronous_signals() { return 1; }
 extern "C" int a081_qvr_client_main() { return run(); }

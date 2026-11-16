@@ -1,3 +1,10 @@
+xr-device-io (0.1.8) unstable; urgency=medium
+
+  * Consume termination synchronously through signalfd without interrupting RPC.
+  * Require the daemon's explicit synchronous-signal plugin contract.
+
+ -- bits <bigbits@hackx.cc>  Tue, 17 Nov 2026 03:39:43 +0800
+
 xr-device-io (0.1.7) unstable; urgency=medium
 
   * Preserve raw SEE timestamps and explicitly convert QTimer to BOOTTIME once.

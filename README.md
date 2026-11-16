@@ -13,6 +13,9 @@ VERY_FAST 请求及传感器 HAL 的周期表；配置中的频率声明和 SEE 
 `XR_SEE_IMU_SOCKET` 和显式启动确认 `XR_SEE_LOW_LATENCY=1`。
 插件与已有 IMU 所有权锁互斥，只向同 UID 的一个 head 消费者发送记录；
 安装不会自动启动它。FastRPC listener 和固件由会话管理器提供。
+此插件要求 `xr-hexagonrpc-daemon >= 0.5.6` 的同步信号能力：listener 和
+采集线程阻塞 SIGTERM/SIGINT，监督路径用 signalfd 接收后执行正常停流。
+旧 daemon 会被显式拒绝，不能依靠 SA_RESTART 重发被中断的 RPC。
 
 保留原厂 104 字节记录及计数器、时间戳和 bias 字段，通过
 `sns_low_lat_stream_poll` 等待固件通知，禁止定时生成替代样本。
