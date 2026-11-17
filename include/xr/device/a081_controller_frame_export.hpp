@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include <xr/device/a081_controller_input_wire.h>
-#include <xr/head/production-v2/a081_tracking_wire.h>
+#include <xr/device/abi_reference.hpp>
 #include <xr/device/a081_camera_groups.hpp>
 #include <xr/device/a081_camera_pixels.hpp>
 #include <xr/device/a081_camera_timing.hpp>
 #include <cmath>
 #include <cstdlib>
-#include <deque>
+#include <array>
+#include <functional>
+#include <utility>
 #include <fcntl.h>
 #include <linux/memfd.h>
-#include <mutex>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -18,6 +19,13 @@
 #include <unistd.h>
 
 namespace a081::stock::controller {
+struct NativeHeadPose {
+    std::uint64_t sample_qtimer_ns{};
+    std::array<float,3> position{};
+    std::array<float,4> orientation_xyzw{};
+};
+using NativeHistoryQuery=std::function<bool(std::uint64_t query_qtimer_ns,NativeHeadPose &)>;
+
 // Optional tee from the existing camera owner. Pixels are copied into a sealed
 // memfd; SDK release callbacks own their mappings independently of V4L2/QVR.
 // No second camera open, synthetic frame, timestamp replacement or prediction.
@@ -56,7 +64,7 @@ public:
                   << (fixed_hand_exposure_ns_ ? "vr700_fixed_controls" : "kernel_sof_schedule")
                   << " observer=" << (hand_observer_ ? "hand" : "controller")
                   << " fixed_nominal_exposure_ns=" << fixed_hand_exposure_ns_
-                  << " optical_phase_verified=0 hmd_sample=real_previous_no_prediction" << std::endl;
+                  << " optical_phase_verified=0 hmd_sample=native_ring_nearest_no_prediction" << std::endl;
     }
     ~FrameExporter()
     {
@@ -66,25 +74,9 @@ public:
                       << " missing_pose=" << missing_pose_ << " dropped=" << dropped_
                       << " optical_phase_verified=0" << std::endl;
     }
-    void pose(const a081_tracking_packet &p)
-    {
-        constexpr auto required=A081_TRACKING_RAW_POSE|A081_TRACKING_CLOCK;
-        if (path_.empty() || p.pose_read_status != A081_POSE_COPIED ||
-            p.pose_boottime_ns != p.gyro_boottime_ns || !p.pose_boottime_ns ||
-            (p.flags&required)!=required || !p.sample_monotonic_ns ||
-            p.sample_monotonic_ns>p.send_monotonic_ns)
-            return;
-        double norm = 0;
-        for (float x : p.rotation_xyzw) { if (!std::isfinite(x)) return; norm += double(x) * x; }
-        for (float x : p.translation) if (!std::isfinite(x)) return;
-        if(!std::isfinite(norm) || norm<=0) return;
-        auto normalized=p;const auto length=std::sqrt(norm);
-        for(auto &x:normalized.rotation_xyzw) x=static_cast<float>(x/length);
-        std::lock_guard<std::mutex> guard(poses_mutex_);
-        if (!poses_.empty() && p.pose_boottime_ns <= poses_.back().pose_boottime_ns) return;
-        poses_.push_back(normalized);
-        while (poses_.size() > 128) poses_.pop_front();
-    }
+    // Bind before capture starts; clear only after capture and main frame
+    // callers have stopped. The callback owns no Ring or DMA lifetime.
+    void set_native_history_query(NativeHistoryQuery query) { history_query_=std::move(query); }
     // Invoked by the serialized group-ready callback, independently of QVR
     // RPC completion. Capture is joined before this exporter is destroyed.
     void frame(const camera::FrameGroup &group)
@@ -116,26 +108,31 @@ public:
         camera::StockY8Time stock_time{};
         if (!camera::stock_a081_y8_time(ctrl_sof, exposure_ns, stock_time)) { ++dropped_; return; }
         const auto ctrl_time = stock_time.exposure_start_boottime_ns;
-        a081_tracking_packet head_pose{};
-        bool have_pose = false;
-        {
-            std::lock_guard<std::mutex> guard(poses_mutex_);
-            auto pose = std::find_if(poses_.rbegin(), poses_.rend(), [&](const auto &p) {
-                return p.pose_boottime_ns <= ctrl_time;
-            });
-            // This bounded previous-head query remains an approximation to
-            // the OEM same-epoch HMD query; do not widen it into stale reuse.
-            // Quality0.2 is the original HMD position-confidence rule, not a
-            // controller detection threshold.
-            have_pose = pose != poses_.rend() && ctrl_time - pose->pose_boottime_ns < 20000000ULL &&
-                std::isfinite(pose->pose_quality) && pose->pose_quality>=0.2f &&
-                (pose->tracking_state&A081_OEM_TRACKING) &&
-                !(pose->tracking_state&(A081_OEM_SUSPENDED|A081_OEM_FATAL_ERROR));
-            if (have_pose) head_pose = *pose;
+        camera::StockY8NativeTime native_time{};
+        if(!camera::stock_a081_y8_native_time(meta.sof_qtimer,exposure_ns,native_time)) { ++dropped_;return; }
+        NativeHeadPose head_pose{};std::uint64_t sample_boot{};
+        // The nonzero camera exposure-start query selects an original Ring1
+        // record by absolute timestamp distance, including future records.
+        // Its epoch remains the returned sample epoch, never the query time.
+        bool have_pose=history_query_ && history_query_(native_time.exposure_start_qtimer_ns,head_pose);
+        if(have_pose) {
+            // Numeric representation only: keep the callback's raw record and
+            // sample epoch, normalize this SDK-bound local quaternion copy.
+            // No norm tolerance, quality, state or query-distance admission.
+            double norm=0;
+            for(float x:head_pose.position) if(!std::isfinite(x)) have_pose=false;
+            for(float x:head_pose.orientation_xyzw) {
+                if(!std::isfinite(x)) have_pose=false;
+                norm+=double(x)*x;
+            }
+            if(!std::isfinite(norm) || norm<=0) have_pose=false;
+            if(have_pose) {
+                const auto length=std::sqrt(norm);
+                for(auto &x:head_pose.orientation_xyzw) x=static_cast<float>(x/length);
+                have_pose=camera::native_sample_boottime(head_pose.sample_qtimer_ns,meta.sample_qtimer,
+                                                        meta.sample_boottime_ns,sample_boot);
+            }
         }
-        // Stock camera timestamps keep the radio clock alive even while QVR
-        // has no valid head pose. Mark that absence explicitly; the SDK must
-        // still reject image fusion without a real, recent head pose.
         if (!have_pose) ++missing_pose_;
         head::Bytes tracking, ctrl;
         if (!camera::side_by_side(group.frames[0].image.y8, group.frames[1].image.y8, tracking) ||
@@ -167,9 +164,9 @@ public:
         packet.ctrl_exposure_ns = exposure_ns;
         packet.camera_clock_bracket_ns = bracket;
         if (have_pose) {
-            packet.hmd_pose_boottime_ns = head_pose.pose_boottime_ns;
-            std::copy(std::begin(head_pose.translation), std::end(head_pose.translation), packet.hmd_position);
-            std::copy(std::begin(head_pose.rotation_xyzw), std::end(head_pose.rotation_xyzw), packet.hmd_orientation_xyzw);
+            packet.hmd_pose_boottime_ns = sample_boot;
+            std::copy(head_pose.position.begin(),head_pose.position.end(), packet.hmd_position);
+            std::copy(head_pose.orientation_xyzw.begin(),head_pose.orientation_xyzw.end(), packet.hmd_orientation_xyzw);
         }
         packet.mosaic_bytes[0] = tracking.size(); packet.mosaic_bytes[1] = ctrl.size();
         packet.mosaic_offsets[1] = tracking.size();
@@ -199,7 +196,12 @@ public:
                           << " ctrl_exposure_ns=" << packet.ctrl_exposure_ns
                           << " hmd_pose_ns=" << packet.hmd_pose_boottime_ns
                           << " hmd_valid=" << have_pose
-                          << " hmd_age_ns=" << (have_pose ? packet.ctrl_exposure_start_boottime_ns - packet.hmd_pose_boottime_ns : 0)
+                          << " hmd_query_qtimer_ns=" << native_time.exposure_start_qtimer_ns
+                          << " hmd_sample_qtimer_ns=" << head_pose.sample_qtimer_ns
+                          << " hmd_query_distance_ns=" << (have_pose ?
+                              (head_pose.sample_qtimer_ns>native_time.exposure_start_qtimer_ns ?
+                               head_pose.sample_qtimer_ns-native_time.exposure_start_qtimer_ns :
+                               native_time.exposure_start_qtimer_ns-head_pose.sample_qtimer_ns) : 0)
                           << " exposure_phase=" << packet.ctrl_exposure_phase << std::endl;
         }
         else { ++dropped_; ::close(fd_); fd_ = -1; }
@@ -239,8 +241,7 @@ private:
     bool hand_observer_ = false;
     std::uint64_t fixed_hand_exposure_ns_{};
     std::string path_;
-    std::mutex poses_mutex_;
-    std::deque<a081_tracking_packet> poses_;
+    NativeHistoryQuery history_query_;
     int fd_{-1};
     std::uint64_t sequence_{}, sent_{}, dropped_{}, missing_pose_{};
 };

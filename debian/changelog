@@ -1,3 +1,11 @@
+xr-device-io (0.1.11) unstable; urgency=medium
+
+  * Replace the AP head cache with a native Ring1 historical-query callback.
+  * Preserve actual head sample epoch using the same QCFT frame clock tuple.
+  * Keep SDK quaternion representation checks separate from OEM quality and query selection.
+
+ -- bits <bigbits@hackx.cc>  Wed, 18 Nov 2026 01:01:28 +0800
+
 xr-device-io (0.1.10) unstable; urgency=medium
 
   * Transfer original native SEE DMA buffers through the single XSL4 fd handshake.

@@ -49,6 +49,8 @@ struct a081_controller_frame_input {
     uint64_t tracking_sof_boottime_ns, ctrl_sof_boottime_ns;
     /* Version2 retains raw QCFT SOF and carries the stock exposure-start time. */
     uint64_t ctrl_exposure_start_boottime_ns, ctrl_exposure_ns;
+    // Actual nearest native head sample epoch; may follow the camera query.
+    // SDK query time is ctrl_exposure_start_boottime_ns, not this sample epoch.
     uint64_t hmd_pose_boottime_ns, camera_clock_bracket_ns;
     double hmd_position[3], hmd_orientation_xyzw[4];
     uint32_t mosaic_bytes[2], mosaic_offsets[2];

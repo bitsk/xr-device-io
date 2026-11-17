@@ -18,6 +18,21 @@ inline bool qtimer_nanoseconds(std::uint64_t ticks,std::uint64_t &out)
     if(ns>UINT64_MAX) return false;
     out=static_cast<std::uint64_t>(ns);return true;
 }
+// Map a real native sample epoch with this same frame's measured clock tuple.
+// The returned sample may be on either side of the camera query. No arrival
+// timestamp, fixed age cap or interpolation participates in this conversion.
+inline bool native_sample_boottime(std::uint64_t sample_qtimer_ns,
+                                   std::uint64_t frame_sample_qtimer_ticks,
+                                   std::uint64_t frame_sample_boottime_ns,
+                                   std::uint64_t &out)
+{
+    std::uint64_t anchor_ns{};
+    if(!sample_qtimer_ns || !frame_sample_qtimer_ticks || !frame_sample_boottime_ns ||
+        !qtimer_nanoseconds(frame_sample_qtimer_ticks,anchor_ns)) return false;
+    const __int128 mapped=static_cast<__int128>(frame_sample_boottime_ns)+sample_qtimer_ns-anchor_ns;
+    if(mapped<=0 || mapped>UINT64_MAX) return false;
+    out=static_cast<std::uint64_t>(mapped);return true;
+}
 inline bool stock_a081_y8_epoch(std::uint64_t sof_ns,std::uint64_t exposure_ns,
                                 std::uint64_t &start,std::uint64_t &submit)
 {
