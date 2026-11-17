@@ -1,3 +1,12 @@
+xr-device-io (0.1.10) unstable; urgency=medium
+
+  * Transfer original native SEE DMA buffers through the single XSL4 fd handshake.
+  * Use verified native flags/registry notification contract and explicit Stop acknowledgement.
+  * Use raw QCFT QTimer time and checked conversion; remove arbitrary clock/age/watchdog gates.
+  * Export available normalized HMD pose and original confidence without whole-pose gates.
+
+ -- bits <bigbits@hackx.cc>  Wed, 18 Nov 2026 00:44:11 +0800
+
 xr-device-io (0.1.9) unstable; urgency=medium
 
   * Refresh the QTimer clock mapping after handshake and every drained batch.

@@ -205,16 +205,16 @@ public:
         const auto header_sof = std::uint64_t(r.header_words[1]) << 24 | r.header_words[0] >> 8;
         constexpr auto required = QCOM_CAMSS_TIMING_VALID | QCOM_CAMSS_TIMING_HEADER_PRESENT | QCOM_CAMSS_TIMING_HEADER_MATCHED;
         bool valid = !(flags & V4L2_BUF_FLAG_ERROR) && (r.flags & required) == required &&
-            !r.lookup_status && r.qtimer_frequency_hz == 19200000 && r.clock_bracket_ns < 5000 &&
+            !r.lookup_status && r.qtimer_frequency_hz == 19200000 &&
             r.sof_qtimer && header_sof == r.sof_qtimer && r.sof_qtimer < r.eof_qtimer && r.eof_qtimer <= r.sample_qtimer &&
             r.sof_monotonic_ns && r.eof_monotonic_ns > r.sof_monotonic_ns &&
             r.sof_boottime_ns && r.eof_boottime_ns > r.sof_boottime_ns && r.csid == slot_ && r.rdi == 0;
         for (auto reserved : r.reserved) valid = valid && reserved == 0;
         if (valid) {
-            valid = r.sample_qtimer - r.sof_qtimer < 19200000;
+            std::uint64_t sof_delta{},eof_delta{};
+            valid=qtimer_nanoseconds(r.sample_qtimer-r.sof_qtimer,sof_delta) &&
+                qtimer_nanoseconds(r.sample_qtimer-r.eof_qtimer,eof_delta);
             if (valid) {
-                const auto sof_delta = (r.sample_qtimer - r.sof_qtimer) * 10000 / 192;
-                const auto eof_delta = (r.sample_qtimer - r.eof_qtimer) * 10000 / 192;
                 valid = r.sample_monotonic_ns >= sof_delta && r.sample_boottime_ns >= sof_delta &&
                     r.sof_monotonic_ns == r.sample_monotonic_ns - sof_delta &&
                     r.eof_monotonic_ns == r.sample_monotonic_ns - eof_delta &&

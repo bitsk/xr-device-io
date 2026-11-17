@@ -50,11 +50,9 @@ constexpr auto forward_block = scalar(6, 1);
 constexpr auto camera_frame = scalar(7, 4);
 constexpr auto tracking_mode = scalar(8, 1);
 constexpr auto qtimer = scalar(9, 0, 1);
-constexpr auto external_sensor_ready = scalar(10, 0);
 constexpr auto ring_layout = scalar(12, 2);
 constexpr auto dsp_clock = scalar(20, 0, 1);
 constexpr auto camera_buffers = scalar(25, 3);
-constexpr auto external_sensor_format = scalar(31, 1); // prim[0] =31, prim size28.
 constexpr auto start_imu_pose = scalar(31, 4);         // prim[0] =40, prim size40.
 constexpr auto stop_imu_pose = scalar(31, 1);          // prim[0] =41, prim size4.
 }
@@ -102,20 +100,6 @@ constexpr RingShape pose_ring{RingId::pose, 64, 192, 80, 0};
 constexpr RingShape predicted_pose_ring{RingId::predicted_pose, 64, 192, 8, 8};
 constexpr RingShape frame_pose_ring{RingId::frame_pose, 64, 64, 80, 10};
 constexpr RingShape dl_prediction_ring{RingId::dl_prediction, 64, 128, 80, 15};
-
-// The stock external-sensor callback caches accelerometer samples and publishes
-// one record on each gyro sample. This describes that shared ring only.
-struct ExternalSensorRecord64 {
-    std::uint64_t gyro_time_ns;   // +0: copied verbatim from callback timestamp.
-    std::uint64_t accel_time_ns;  // +8: most recently cached accel timestamp.
-    float gyro[3];               // +16; SDK callback specifies rad/s.
-    float accel[3];              // +28; SDK callback specifies m/s^2.
-    std::uint8_t zeroed[20];      // +40..59: zero stores in this writer.
-    std::uint8_t unwritten[4];    // +60..63: writer does not set these bytes.
-};
-static_assert(sizeof(ExternalSensorRecord64) == 64);
-static_assert(offsetof(ExternalSensorRecord64, gyro) == 16);
-static_assert(offsetof(ExternalSensorRecord64, accel) == 28);
 
 // ARM32 tracker cameraupdate has 96-byte host records. The pointer at +16 is
 // extracted into an individual FastRPC input buffer; wire records are88 bytes.

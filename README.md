@@ -15,11 +15,11 @@ VERY_FAST 请求及传感器 HAL 的周期表；配置中的频率声明和 SEE 
 安装不会自动启动它。FastRPC listener 和固件由会话管理器提供。
 此插件要求 `xr-hexagonrpc-daemon >= 0.5.6` 的同步信号能力：listener 和
 采集线程阻塞 SIGTERM/SIGINT，监督路径用 signalfd 接收后执行正常停流。
-旧 daemon 会被显式拒绝，不能依靠 SA_RESTART 重发被中断的 RPC。
+listener 通过同步信号契约执行停流，不能依靠 SA_RESTART 重发被中断的 RPC。
 
 保留原厂 104 字节记录及计数器、时间戳和 bias 字段，通过
 `sns_low_lat_stream_poll` 等待固件通知，禁止定时生成替代样本。
-XSL3 包为 168 字节，包含完整原始记录、显式有符号 `qtimer_to_boottime_ns`、
+XSL4 事件包为168字节，包含完整原始记录、显式有符号 `qtimer_to_boottime_ns`、
 本批 QTimer 锚点、夹取测量误差与历史换算速率上界。
 QTimer 与 BOOTTIME 的偏移在消费者握手后、每批 drain 后重新夹取测量；
 NTP 正常调频允许逐包偏移变化。DSP 配置偏移固定为零，
@@ -32,9 +32,16 @@ NTP 正常调频允许逐包偏移变化。DSP 配置偏移固定为零，
 adjtime 0.5 ms/s 的总界；不代表实际测量误差。支持边界为 19.2 MHz
 `arch_sys_counter`、USER_HZ=100 / tick=10000 us、无 PPS 相位修正与非零
 `ntp_tick_adj`；不修改系统 NTP。夹取量化余量覆盖计数器及该时钟源整数转换，
-最大历史记录年龄仍为 1 秒，超出支持边界或检测到不连续则明确失败。
+不以1秒事件年龄、1毫秒夹取跨度或500微秒误差拒绝真实元组；误差保留在字段中，算术不可表示或时钟关系不一致才失败。
 不再对未校准三轴值重复扣 bias，也不二次旋转 Android 坐标。
-结束时先 stop 唤醒等待者，随后 join、deinit/unmap 和关闭独立 SDSP 会话。
+XSL4 首先用32字节控制消息和 SCM_RIGHTS 向唯一 head 消费者交接两个真实 DMA fd
+（accel、gyro顺序）。head 完成 CDSP 原厂 ring0/5 注册及接收线程启动后发送 Start，
+生产者才配置 SEE 流。原厂 `sns_llcm/qti_vr_mode=1` 的原生通知独立唤醒 CDSP QDI；
+AP poll 只负责真实元数据交付，不能视为 QDI 已成功的证据。flags2 的 bit1 是
+Android104输出，bit2 是标定标志；未校准类型由16/35选择，不猜测其他 SDK 的中断位。
+原厂 VR 模式本身跳过 timestamp_offset，因此共享输入保持 QTimer 纳秒。
+结束时接收 Stop，先停流唤醒等待者、join、deinit/unmap，再回 Stopped。
+head 的导入 fd 引用保留到 CDSP stop/deinit 和借用映射释放之后。
 通知、缓存可见性、真实频率和退出后的 DMA 回收仍需在目标硬件验证。
 
 

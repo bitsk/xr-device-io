@@ -85,9 +85,9 @@ bool clock_anchor(ClockAnchor &anchor) {
             best=span;anchor.offset=static_cast<std::int64_t>(offset);anchor.qtimer=ns;
         }
     }
-    if (best>1000000) return false;
-    // Two counter quanta cover counter conversion plus the 19.2 MHz
-    // clocksource multiplier rounding over the accepted <=1 s record age.
+    if(best==UINT64_MAX) return false;
+    // Preserve the measured bracket, however wide. Two counter quanta cover
+    // counter reads/conversion; rate uncertainty remains an explicit bound.
     anchor.uncertainty=(best+1)/2+2*xr::see::qtimer_tick_ns;return true;
 #else
     (void)anchor;return false;
@@ -165,21 +165,48 @@ int run() {
     xr::see::LowLatencyChannel accel(session,module),gyro(session,module);
     xr::see::LowLatencyChannel *channels[]{&accel,&gyro};
     constexpr unsigned period=1250;
-    bool ok=true;
+    bool ok=true, requested_stop=false;
     for(unsigned i=0;i<2 && ok;++i) {
         std::fprintf(stderr,"stage=see_init_begin boottime_ns=%llu kind=%u\n",(unsigned long long)now(),i);
         rc=channels[i]->initialize();
         std::fprintf(stderr,"stage=see_init_end boottime_ns=%llu kind=%u rc=%d\n",(unsigned long long)now(),i,rc);
-        if (!rc) rc=channels[i]->configure(ids[i],i+1);
+        ok=rc==0;
+    }
+    if(ok) {
+        const std::array<int,2> fds{{accel.dma_fd(),gyro.dma_fd()}};
+        rc=xr::see::send_control(peer,xr::see::Command::buffers,&fds);
+        ok=rc==0;
+    }
+    // The sole consumer first imports the same DMA allocations into CDSP,
+    // registers both original descriptors and starts QVR's native receiver.
+    // Streaming begins only after that explicit handoff, never on connect.
+    bool ready=false;
+    while(ok && !ready && !interrupted) {
+        pollfd p[]{{peer,POLLIN,0},{termination.fd,POLLIN,0}};
+        rc=poll(p,2,100);
+        if(rc<0 && errno==EINTR) continue;
+        if(rc<0 || (p[0].revents&(POLLERR|POLLHUP|POLLNVAL))) { ok=false;break; }
+        if(p[1].revents) { interrupted=termination.consume();break; }
+        if(!(p[0].revents&POLLIN)) continue;
+        xr::see::Control control{};std::array<int,2> fds{{-1,-1}};
+        rc=xr::see::receive_control(peer,control,fds);
+        for(int fd:fds) if(fd>=0) close(fd);
+        if(rc || (control.command!=xr::see::Command::start && control.command!=xr::see::Command::stop)) {
+            ok=false;break;
+        }
+        requested_stop=control.command==xr::see::Command::stop;
+        ready=true;
+    }
+    for(unsigned i=0;i<2 && ok && !requested_stop && !interrupted;++i) {
+        rc=channels[i]->configure(ids[i],i+1);
         std::fprintf(stderr,"stage=see_config boottime_ns=%llu kind=%u period_us=%u rc=%d dsp_offset_ns=0 qtimer_to_boottime_ns=%lld uncertainty_ns=%llu\n",
                      (unsigned long long)now(),i,period,rc,(long long)initial.offset,(unsigned long long)initial.uncertainty);
         ok=rc==0;
     }
-    std::atomic<bool> stopping{!ok}, failed{false}, disconnected{false};
-    std::atomic<std::uint64_t> received[2]{};
+    std::atomic<bool> stopping{!ok || requested_stop || interrupted}, failed{false}, disconnected{false};
     std::mutex output;
     std::thread workers[2];
-    if(ok) for(unsigned i=0;i<2;++i) workers[i]=std::thread([&,i] {
+    if(ok && !requested_stop && !interrupted) for(unsigned i=0;i<2;++i) workers[i]=std::thread([&,i] {
         std::uint64_t last=0,last_raw=0,max_age=0,max_uncertainty=0;
         ClockAnchor previous=initial;
         bool first=true;
@@ -202,8 +229,10 @@ int run() {
             }
             const auto elapsed=anchor.qtimer-previous.qtimer;
             const __int128 drift=static_cast<__int128>(anchor.offset)-previous.offset;
-            const auto bound=xr::see::mapping_uncertainty(elapsed,anchor.uncertainty+previous.uncertainty);
-            if(drift>bound || drift<-static_cast<__int128>(bound)) {
+            const auto combined=static_cast<unsigned __int128>(anchor.uncertainty)+previous.uncertainty;
+            if(combined>=UINT64_MAX) { failed=true;break; }
+            const auto bound=xr::see::mapping_uncertainty(elapsed,static_cast<std::uint64_t>(combined));
+            if(bound==UINT64_MAX || drift>bound || drift<-static_cast<__int128>(bound)) {
                 std::fprintf(stderr,"stage=see_clock error=discontinuity kind=%u\n",i);failed=true;break;
             }
             previous=anchor;
@@ -234,32 +263,29 @@ int run() {
                     if(errno==EPIPE || errno==ECONNRESET) disconnected=true; else failed=true;
                     break;
                 }
-                received[i]=packet.arrival_boottime_ns;
             }
         }
         std::fprintf(stderr,"stage=see_clock_summary kind=%u max_anchor_age_ns=%llu max_model_uncertainty_ns=%llu rate_bound_ppb=%llu\n",
             i,(unsigned long long)max_age,(unsigned long long)max_uncertainty,(unsigned long long)xr::see::clock_rate_bound_ppb);
     });
-    auto start=now();
-    while(ok && !interrupted && !failed.load() && !disconnected.load()) {
+    while(ok && !requested_stop && !interrupted && !failed.load() && !disconnected.load()) {
         pollfd p[]{{peer,POLLIN,0},{termination.fd,POLLIN,0}};rc=poll(p,2,100);
         if(rc<0 && errno!=EINTR) { ok=false;break; }
         if(p[1].revents) { interrupted=termination.consume();ok=interrupted;break; }
         if(p[0].revents) {
             char byte;
             auto n=recv(peer,&byte,1,MSG_DONTWAIT|MSG_PEEK);
-            if(n==0 || (n<0 && errno==ECONNRESET)) disconnected=true; else ok=false;
+            if(n==0 || (n<0 && errno==ECONNRESET)) disconnected=true;
+            else {
+                xr::see::Control control{};std::array<int,2> fds{{-1,-1}};
+                rc=xr::see::receive_control(peer,control,fds);
+                for(int fd:fds) if(fd>=0) close(fd);
+                requested_stop=!rc && control.command==xr::see::Command::stop;
+                if(!requested_stop) ok=false;
+            }
             break;
         }
-        auto current=now();
-        for(unsigned i=0;i<2;++i) {
-            auto last=received[i].load();
-            if(current>(last?last:start)+1000000000) {
-                std::fprintf(stderr,"stage=see_timeout boottime_ns=%llu kind=%u last_ns=%llu\n",
-                    (unsigned long long)current,i,(unsigned long long)last);
-                ok=false;break;
-            }
-        }
+
     }
     stopping=true;
     bool stopped=true;
@@ -289,6 +315,18 @@ int run() {
         (unsigned long long)after[2],(unsigned long long)(after[3]-before[3]),
         (unsigned long long)gyro.skipped(),(unsigned long long)accel.skipped());
     if(!balanced) std::_Exit(1);
+    if(requested_stop && ok && !failed.load()) {
+        const auto deadline=now()+8000000000ULL;
+        do {
+            rc=xr::see::send_control(peer,xr::see::Command::stopped);
+            if(rc!=-EAGAIN && rc!=-EWOULDBLOCK && rc!=-EINTR) break;
+            pollfd writable{peer,POLLOUT,0};
+            const int ready=poll(&writable,1,100);
+            if(ready<0 && errno!=EINTR) break;
+            if(writable.revents&(POLLERR|POLLHUP|POLLNVAL)) break;
+        } while(now()<deadline);
+        ok=rc==0;
+    }
     // init registers a DSP process-local-storage destructor in this module.
     // deinit stops streaming and unmaps memory but does not unregister that
     // destructor. Keep its code loaded until FastRPC process teardown, as

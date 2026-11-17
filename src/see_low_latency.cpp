@@ -9,9 +9,54 @@
 #include <misc/fastrpc.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace xr::see {
+int send_control(int socket, Command command, const std::array<int, 2> *fds) {
+    Control control{}; control.command=command;
+    iovec io{&control,sizeof(control)};
+    alignas(cmsghdr) char ancillary[CMSG_SPACE(2*sizeof(int))]{};
+    msghdr message{};message.msg_iov=&io;message.msg_iovlen=1;
+    if(fds) {
+        if(command!=Command::buffers || (*fds)[0]<0 || (*fds)[1]<0) return -EINVAL;
+        message.msg_control=ancillary;message.msg_controllen=sizeof(ancillary);
+        auto *header=CMSG_FIRSTHDR(&message);header->cmsg_level=SOL_SOCKET;
+        header->cmsg_type=SCM_RIGHTS;header->cmsg_len=CMSG_LEN(2*sizeof(int));
+        std::memcpy(CMSG_DATA(header),fds->data(),2*sizeof(int));
+    } else if(command==Command::buffers) return -EINVAL;
+    const auto n=sendmsg(socket,&message,MSG_NOSIGNAL);
+    return n==sizeof(control) ? 0 : (n<0 ? -errno : -EPROTO);
+}
+int receive_control(int socket, Control &out, std::array<int, 2> &fds) {
+    Control control{};iovec io{&control,sizeof(control)};
+    alignas(cmsghdr) char ancillary[CMSG_SPACE(2*sizeof(int))]{};
+    msghdr message{};message.msg_iov=&io;message.msg_iovlen=1;
+    message.msg_control=ancillary;message.msg_controllen=sizeof(ancillary);
+    const auto n=recvmsg(socket,&message,MSG_CMSG_CLOEXEC|MSG_TRUNC);
+    if(n<0) return -errno;
+    std::array<int,2> received{{-1,-1}};unsigned count=0;bool invalid=false;
+    for(auto *h=CMSG_FIRSTHDR(&message);h;h=CMSG_NXTHDR(&message,h)) {
+        if(h->cmsg_level!=SOL_SOCKET || h->cmsg_type!=SCM_RIGHTS || h->cmsg_len<CMSG_LEN(0)) {
+            invalid=true;continue;
+        }
+        const auto bytes=h->cmsg_len-CMSG_LEN(0);
+        if(bytes%sizeof(int)) invalid=true;
+        for(std::size_t at=0;at+sizeof(int)<=bytes;at+=sizeof(int)) {
+            int fd=-1;std::memcpy(&fd,static_cast<char *>(static_cast<void *>(CMSG_DATA(h)))+at,sizeof(fd));
+            if(count<received.size()) received[count++]=fd;
+            else { ::close(fd);invalid=true; }
+        }
+    }
+    invalid=invalid || n!=sizeof(control) || (message.msg_flags&(MSG_CTRUNC|MSG_TRUNC)) ||
+        control.magic!=packet_magic || control.allocation_bytes!=allocation_bytes ||
+        control.event_bytes!=event_bytes || control.channels!=2 || control.period_us!=1250 ||
+        control.flags!=2 || control.reserved ||
+        static_cast<unsigned>(control.command)<1 || static_cast<unsigned>(control.command)>4 ||
+        count!=(control.command==Command::buffers ? 2u : 0u);
+    if(invalid) { for(int fd:received) if(fd>=0) ::close(fd);return -EPROTO; }
+    out=control;fds=received;return 0;
+}
 namespace {
 void put32(void *p, std::size_t off, std::uint32_t v) {
     auto *b = static_cast<std::uint8_t *>(p) + off;
@@ -33,18 +78,19 @@ std::uint64_t get64(const Event &e, std::size_t n) {
     return get32(e,n) | std::uint64_t(get32(e,n+4))<<32;
 }
 std::uint64_t mapping_uncertainty(std::uint64_t age, std::uint64_t anchor_uncertainty) {
-    return anchor_uncertainty + static_cast<std::uint64_t>(
-        (static_cast<unsigned __int128>(age)*clock_rate_bound_ppb+999999999)/1000000000);
+    const auto value=static_cast<unsigned __int128>(anchor_uncertainty)+
+        (static_cast<unsigned __int128>(age)*clock_rate_bound_ppb+999999999)/1000000000;
+    // Sentinel means the bound cannot be represented in the wire tuple.
+    return value>=UINT64_MAX ? UINT64_MAX : static_cast<std::uint64_t>(value);
 }
 bool decode(const Packet &p, bool gyro, std::uint64_t &time, float xyz[3]) {
     const auto &e = p.event;
-    // Flags 2 request Android uncalibrated samples. Do not silently accept a
-    // calibrated source or subtract the bias fields a second time.
+    // Flag bit1 selects Android104 layout. Types16/35 select uncalibrated
+    // variants; bit2 is the independent is_calibrated flag. No bias subtraction.
     if (p.magic != packet_magic || p.kind != unsigned(gyro) || get32(e,0) != event_bytes ||
         get32(e,8) != (gyro ? 16u : 35u) || !get32(e,12) ||
         !p.arrival_boottime_ns || !p.clock_anchor_qtimer_ns || p.reserved ||
         p.clock_anchor_uncertainty_ns < 2*qtimer_tick_ns ||
-        p.clock_anchor_uncertainty_ns > 500000+2*qtimer_tick_ns ||
         p.clock_rate_bound_ppb != clock_rate_bound_ppb ||
         p.requested_period_us!=1250) return false;
     const auto raw_stamp = get64(e,16);
@@ -55,15 +101,15 @@ bool decode(const Packet &p, bool gyro, std::uint64_t &time, float xyz[3]) {
         raw_stamp-p.clock_anchor_qtimer_ns > qtimer_tick_ns) return false;
     const auto age = raw_stamp>p.clock_anchor_qtimer_ns ? raw_stamp-p.clock_anchor_qtimer_ns :
                      p.clock_anchor_qtimer_ns-raw_stamp;
-    if (age>1000000000 || p.clock_uncertainty_ns != mapping_uncertainty(age,p.clock_anchor_uncertainty_ns))
+    if(p.clock_uncertainty_ns==UINT64_MAX ||
+        p.clock_uncertainty_ns!=mapping_uncertainty(age,p.clock_anchor_uncertainty_ns))
         return false;
     const __int128 anchor_boot = static_cast<__int128>(p.clock_anchor_qtimer_ns)+p.qtimer_to_boottime_ns;
     if (anchor_boot<=0 || anchor_boot>p.arrival_boottime_ns) return false;
     const __int128 converted = static_cast<__int128>(raw_stamp) + p.qtimer_to_boottime_ns;
     if (!raw_stamp || converted<=0 || converted>UINT64_MAX) return false;
     const auto stamp = static_cast<std::uint64_t>(converted);
-    if ((stamp > p.arrival_boottime_ns && stamp-p.arrival_boottime_ns > qtimer_tick_ns) ||
-        (stamp < p.arrival_boottime_ns && p.arrival_boottime_ns-stamp > 1000000000)) return false;
+    if(stamp>p.arrival_boottime_ns && stamp-p.arrival_boottime_ns>qtimer_tick_ns) return false;
     float values[3];
     for (unsigned i=0; i<3; ++i) {
         auto word = get32(e,24+4*i); std::memcpy(values+i,&word,4);

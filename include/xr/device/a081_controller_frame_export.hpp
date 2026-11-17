@@ -68,17 +68,21 @@ public:
     }
     void pose(const a081_tracking_packet &p)
     {
-        if (path_.empty() || p.pose_read_status != A081_POSE_COPIED || p.pose_quality != 1 ||
-            p.tracking_state != 4 || p.pose_boottime_ns != p.gyro_boottime_ns ||
-            !p.pose_boottime_ns || (p.flags & A081_TRACKING_KNOWN_FLAGS) != A081_TRACKING_KNOWN_FLAGS)
+        constexpr auto required=A081_TRACKING_RAW_POSE|A081_TRACKING_CLOCK;
+        if (path_.empty() || p.pose_read_status != A081_POSE_COPIED ||
+            p.pose_boottime_ns != p.gyro_boottime_ns || !p.pose_boottime_ns ||
+            (p.flags&required)!=required || !p.sample_monotonic_ns ||
+            p.sample_monotonic_ns>p.send_monotonic_ns)
             return;
         double norm = 0;
-        for (float x : p.rotation_xyzw) { if (!std::isfinite(x)) return; norm += x * x; }
+        for (float x : p.rotation_xyzw) { if (!std::isfinite(x)) return; norm += double(x) * x; }
         for (float x : p.translation) if (!std::isfinite(x)) return;
-        if (std::abs(norm - 1) > .01) return;
+        if(!std::isfinite(norm) || norm<=0) return;
+        auto normalized=p;const auto length=std::sqrt(norm);
+        for(auto &x:normalized.rotation_xyzw) x=static_cast<float>(x/length);
         std::lock_guard<std::mutex> guard(poses_mutex_);
         if (!poses_.empty() && p.pose_boottime_ns <= poses_.back().pose_boottime_ns) return;
-        poses_.push_back(p);
+        poses_.push_back(normalized);
         while (poses_.size() > 128) poses_.pop_front();
     }
     // Invoked by the serialized group-ready callback, independently of QVR
@@ -119,7 +123,14 @@ public:
             auto pose = std::find_if(poses_.rbegin(), poses_.rend(), [&](const auto &p) {
                 return p.pose_boottime_ns <= ctrl_time;
             });
-            have_pose = pose != poses_.rend() && ctrl_time - pose->pose_boottime_ns < 20000000ULL;
+            // This bounded previous-head query remains an approximation to
+            // the OEM same-epoch HMD query; do not widen it into stale reuse.
+            // Quality0.2 is the original HMD position-confidence rule, not a
+            // controller detection threshold.
+            have_pose = pose != poses_.rend() && ctrl_time - pose->pose_boottime_ns < 20000000ULL &&
+                std::isfinite(pose->pose_quality) && pose->pose_quality>=0.2f &&
+                (pose->tracking_state&A081_OEM_TRACKING) &&
+                !(pose->tracking_state&(A081_OEM_SUSPENDED|A081_OEM_FATAL_ERROR));
             if (have_pose) head_pose = *pose;
         }
         // Stock camera timestamps keep the radio clock alive even while QVR
@@ -133,7 +144,7 @@ public:
         }
         std::uint64_t bracket = 0;
         for (const auto &f : group.frames) bracket = std::max(bracket, std::uint64_t(f.timing.clock_bracket_ns));
-        if (bracket >= 5000 || !connect()) { ++dropped_; return; }
+        if (!connect()) { ++dropped_; return; }
         a081_controller_frame_input packet{};
         packet.header = {A081_CONTROLLER_INPUT_MAGIC, A081_CONTROLLER_INPUT_VERSION, sizeof(packet),
                          A081_CONTROLLER_INPUT_FRAME, ++sequence_, monotonic_ns()};
