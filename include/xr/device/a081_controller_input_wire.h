@@ -23,6 +23,10 @@ enum {
     A081_CONTROLLER_FRAME_RAW_QVR_POSE = 4,
     /* Kernel SOF-associated schedule validity; not physical LED acceptance. */
     A081_CONTROLLER_FRAME_KERNEL_EXPOSURE_PHASE = 8,
+    /* Hand observer only: equal fixed controls read back before STREAMON.
+     * Mutually exclusive with KERNEL_EXPOSURE_PHASE; phase remains UINT32_MAX
+     * and schedule timestamps remain zero. Not optical exposure validation. */
+    A081_CONTROLLER_FRAME_FIXED_EXPOSURE_CONTROLS = 16,
     A081_CONTROLLER_FRAME_REQUIRED = 15
 };
 

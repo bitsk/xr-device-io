@@ -33,7 +33,29 @@ public:
         path_ = path;
         if (std::getenv("A081_CONTROLLER_CANDIDATE_PHASE") || std::getenv("A081_CONTROLLER_FRAME_PHASE_PROFILE"))
             throw std::runtime_error("Sequence-derived controller phases are unsupported; require QCFT v2 kernel schedule");
-        std::cout << "stage=controller_frame_export configured=1 phase_source=kernel_sof_schedule"
+        const char *device = std::getenv("XR_DEVICE");
+        if (hand_observer_ && device && std::string(device) == "vr700") {
+            // capture_live verifies the selected DT identity. The session
+            // reads these fixed controls back before STREAMON; no AE/pattern
+            // runs in this mode. Preserve their nominal, non-optical scope.
+            auto exposure = [](const char *key) {
+                const char *value = std::getenv(key);
+                char *end = nullptr;
+                errno = 0;
+                const auto ns = value ? std::strtoull(value, &end, 10) : 0;
+                if (errno || !value || *value < '0' || *value > '9' || !end || *end ||
+                    !ns || ns > 1000000000ULL)
+                    throw std::runtime_error("Missing/invalid fixed hand exposure controls");
+                return ns;
+            };
+            fixed_hand_exposure_ns_ = exposure("A081_QVR_CAMERA_EXPOSURE_NS");
+            if (fixed_hand_exposure_ns_ != exposure("A081_CONTROLLER_CAMERA_EXPOSURE_NS"))
+                throw std::runtime_error("Fixed hand capture requires equal four-camera exposure");
+        }
+        std::cout << "stage=controller_frame_export configured=1 phase_source="
+                  << (fixed_hand_exposure_ns_ ? "vr700_fixed_controls" : "kernel_sof_schedule")
+                  << " observer=" << (hand_observer_ ? "hand" : "controller")
+                  << " fixed_nominal_exposure_ns=" << fixed_hand_exposure_ns_
                   << " optical_phase_verified=0 hmd_sample=real_previous_no_prediction" << std::endl;
     }
     ~FrameExporter()
@@ -67,13 +89,28 @@ public:
         const auto &meta = group.frames[2].timing;
         // A separate observer consumes only matched long-exposure groups.
         // The existing controller exporter continues receiving every phase.
-        if (hand_observer_ && (meta.exposure_phase != 2 || !connect())) return;
-        if (!camera::valid_pattern_exposure(meta) || !camera::valid_pattern_exposure(group.frames[3].timing)) {
+        if (hand_observer_ && ((!fixed_hand_exposure_ns_ && meta.exposure_phase != 2) || !connect())) return;
+        if (fixed_hand_exposure_ns_) {
+            // Require the actual fixed-mode QCFT state for all four verified
+            // image pairs. Missing SOF or an invalid/partial schedule is not a
+            // fixed-exposure fallback. FrameGroups retains its 1 ms gate.
+            for (const auto &frame : group.frames) {
+                const auto &t = frame.timing;
+                if (!(t.flags & QCOM_CAMSS_TIMING_VALID) ||
+                    (t.flags & (QCOM_CAMSS_TIMING_PATTERN_ACTIVE | QCOM_CAMSS_TIMING_EXPOSURE_VALID)) ||
+                    !t.sof_qtimer || !t.sof_boottime_ns || t.exposure_phase != UINT32_MAX ||
+                    t.exposure_status != -ENODATA || t.exposure_ns || t.phase_anchor_sof_qtimer ||
+                    t.control_apply_sof_qtimer || t.control_applied_boottime_ns) {
+                    ++dropped_; return;
+                }
+            }
+        } else if (!camera::valid_pattern_exposure(meta) || !camera::valid_pattern_exposure(group.frames[3].timing)) {
             ++dropped_; return;
         }
+        const auto exposure_ns = fixed_hand_exposure_ns_ ? fixed_hand_exposure_ns_ : meta.exposure_ns;
         const auto ctrl_sof = meta.sof_boottime_ns;
         camera::StockY8Time stock_time{};
-        if (!camera::stock_a081_y8_time(ctrl_sof, meta.exposure_ns, stock_time)) { ++dropped_; return; }
+        if (!camera::stock_a081_y8_time(ctrl_sof, exposure_ns, stock_time)) { ++dropped_; return; }
         const auto ctrl_time = stock_time.exposure_start_boottime_ns;
         a081_tracking_packet head_pose{};
         bool have_pose = false;
@@ -106,7 +143,8 @@ public:
         packet.ctrl_frame_id = group.frames[2].image.sequence;
         packet.flags = A081_CONTROLLER_FRAME_REAL_QCFT_PAIR | A081_CONTROLLER_FRAME_STOCK_CAMERA_ORDER;
         if (have_pose) packet.flags |= A081_CONTROLLER_FRAME_RAW_QVR_POSE;
-        packet.flags |= A081_CONTROLLER_FRAME_KERNEL_EXPOSURE_PHASE;
+        packet.flags |= fixed_hand_exposure_ns_ ? A081_CONTROLLER_FRAME_FIXED_EXPOSURE_CONTROLS :
+                                                 A081_CONTROLLER_FRAME_KERNEL_EXPOSURE_PHASE;
         packet.ctrl_sensor_sequence = meta.sensor_sequence;
         packet.ctrl_exposure_phase = meta.exposure_phase;
         packet.ctrl_phase_anchor_sof_qtimer = meta.phase_anchor_sof_qtimer;
@@ -115,7 +153,7 @@ public:
         packet.tracking_sof_boottime_ns = group.frames[0].timing.sof_boottime_ns;
         packet.ctrl_sof_boottime_ns = ctrl_sof;
         packet.ctrl_exposure_start_boottime_ns = ctrl_time;
-        packet.ctrl_exposure_ns = meta.exposure_ns;
+        packet.ctrl_exposure_ns = exposure_ns;
         packet.camera_clock_bracket_ns = bracket;
         if (have_pose) {
             packet.hmd_pose_boottime_ns = head_pose.pose_boottime_ns;
@@ -188,6 +226,7 @@ private:
         fd_ = fd; return true;
     }
     bool hand_observer_ = false;
+    std::uint64_t fixed_hand_exposure_ns_{};
     std::string path_;
     std::mutex poses_mutex_;
     std::deque<a081_tracking_packet> poses_;
