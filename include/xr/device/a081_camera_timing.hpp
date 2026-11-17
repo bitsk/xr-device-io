@@ -14,9 +14,10 @@ struct StockY8NativeTime {
 // 19.2 MHz hardware epoch. Check representation, not an elapsed-time limit.
 inline bool qtimer_nanoseconds(std::uint64_t ticks,std::uint64_t &out)
 {
-    const auto ns=(static_cast<unsigned __int128>(ticks)*625)/12;
-    if(ns>UINT64_MAX) return false;
-    out=static_cast<std::uint64_t>(ns);return true;
+    // Quotient/remainder form is exact on both ARM32 and ARM64.
+    const auto whole=ticks/12, fraction=(ticks%12)*625/12;
+    if(whole>(UINT64_MAX-fraction)/625) return false;
+    out=whole*625+fraction;return true;
 }
 // Map a real native sample epoch with this same frame's measured clock tuple.
 // The returned sample may be on either side of the camera query. No arrival
@@ -29,9 +30,16 @@ inline bool native_sample_boottime(std::uint64_t sample_qtimer_ns,
     std::uint64_t anchor_ns{};
     if(!sample_qtimer_ns || !frame_sample_qtimer_ticks || !frame_sample_boottime_ns ||
         !qtimer_nanoseconds(frame_sample_qtimer_ticks,anchor_ns)) return false;
-    const __int128 mapped=static_cast<__int128>(frame_sample_boottime_ns)+sample_qtimer_ns-anchor_ns;
-    if(mapped<=0 || mapped>UINT64_MAX) return false;
-    out=static_cast<std::uint64_t>(mapped);return true;
+    if(sample_qtimer_ns>=anchor_ns) {
+        const auto delta=sample_qtimer_ns-anchor_ns;
+        if(frame_sample_boottime_ns>UINT64_MAX-delta) return false;
+        out=frame_sample_boottime_ns+delta;
+    } else {
+        const auto delta=anchor_ns-sample_qtimer_ns;
+        if(frame_sample_boottime_ns<=delta) return false;
+        out=frame_sample_boottime_ns-delta;
+    }
+    return true;
 }
 inline bool stock_a081_y8_epoch(std::uint64_t sof_ns,std::uint64_t exposure_ns,
                                 std::uint64_t &start,std::uint64_t &submit)
