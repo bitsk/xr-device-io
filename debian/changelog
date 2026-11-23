@@ -1,3 +1,9 @@
+xr-device-io (0.1.13) unstable; urgency=medium
+
+  * Deliver bounded left and right motor commands through the Nordic owner.
+
+ -- bits <bigbits@hackx.cc>  Mon, 23 Nov 2026 14:25:00 +0800
+
 xr-device-io (0.1.12) unstable; urgency=medium
 
   * Use exact checked 64-bit arithmetic for the native camera clock contract

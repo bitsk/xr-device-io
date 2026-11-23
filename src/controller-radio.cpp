@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Single real Nordic transport owner: forward raw packets to the SDK helper,
 // optionally return timestamps of actual camera frames. Never pairs or flashes.
+#include <xr/device/a081_controller_haptics.h>
 #include <xr/device/a081_controller_input_wire.h>
 #include <xr/device/a081_radio_clock_reference.h>
 #define _Static_assert static_assert
@@ -65,6 +66,91 @@ struct TimestampFollowup {
     unsigned hand{}, remaining{};
     std::uint64_t attempt{}, request_sequence{}, irq_sequence{};
 };
+class Haptics
+{
+public:
+    void receive(int fd, uid_t uid)
+    {
+        for (unsigned i = 0; i < 8; ++i) {
+            a081_haptic_request request{};
+            iovec data{&request, sizeof(request)};
+            alignas(cmsghdr) char credentials[CMSG_SPACE(sizeof(ucred))]{};
+            msghdr message{};
+            message.msg_iov = &data;
+            message.msg_iovlen = 1;
+            message.msg_control = credentials;
+            message.msg_controllen = sizeof(credentials);
+            const auto received = recvmsg(fd, &message, MSG_DONTWAIT | MSG_TRUNC);
+            if (received < 0) return;
+
+            const auto *header = CMSG_FIRSTHDR(&message);
+            ucred peer{};
+            if (!header || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_CREDENTIALS ||
+                header->cmsg_len != CMSG_LEN(sizeof(peer)) || (message.msg_flags & MSG_CTRUNC))
+                continue;
+            std::memcpy(&peer, CMSG_DATA(header), sizeof(peer));
+            const auto stamp = now(CLOCK_MONOTONIC);
+            if (peer.uid != uid || received != sizeof(request) || request.magic != A081_HAPTIC_MAGIC ||
+                request.hand > 1 || request.strength > A081_HAPTIC_MAX_STRENGTH || !fresh(request, stamp) ||
+                (request.strength ? request.duration_ms < A081_HAPTIC_MIN_MS ||
+                     request.duration_ms > A081_HAPTIC_MAX_MS : request.duration_ms != 0))
+                continue;
+            auto &queued = pending[request.hand];
+            if (request.monotonic_ns >= queued.monotonic_ns) queued = request;
+        }
+    }
+
+    void saw_controller(unsigned hand, std::uint64_t stamp) { last_controller[hand] = stamp; }
+
+    int pack(std::uint8_t *tx, std::uint64_t stamp)
+    {
+        int selected = -1;
+        for (unsigned hand = 0; hand < 2; ++hand) {
+            auto &request = pending[hand];
+            if (!fresh(request, stamp) || !last_controller[hand] ||
+                stamp - last_controller[hand] >= A081_HAPTIC_MAX_AGE_NS) {
+                request = {};
+                continue;
+            }
+            if (selected < 0 || request.monotonic_ns < pending[selected].monotonic_ns)
+                selected = int(hand);
+        }
+        if (selected < 0) return -1;
+
+        const auto &request = pending[selected];
+        // Motor frame on the current dual-slot firmware. Destination IDs are 1/2.
+        // The right destination matches the previously wearer-verified 0x62 frame.
+        const std::uint8_t body[] = {0xa5, 9, std::uint8_t(0x61 + selected),
+            std::uint8_t((request.strength << 4) | (request.duration_ms >> 8)),
+            std::uint8_t(request.duration_ms), 0, 0, 0x0f};
+        std::memcpy(tx, body, sizeof(body));
+        std::uint8_t checksum = 0;
+        for (unsigned i = 1; i < sizeof(body); ++i) checksum += body[i];
+        tx[sizeof(body)] = checksum;
+        return selected;
+    }
+
+    void sent(unsigned hand, std::uint64_t irq_sequence)
+    {
+        const auto &request = pending[hand];
+        std::printf("{\"kind\":\"radio_haptic_tx\",\"hand\":%u,\"strength\":%u,"
+                    "\"duration_ms\":%u,\"request_ns\":%llu,\"irq_sequence\":%llu}\n",
+                    hand, unsigned(request.strength), unsigned(request.duration_ms),
+                    static_cast<unsigned long long>(request.monotonic_ns),
+                    static_cast<unsigned long long>(irq_sequence));
+        pending[hand] = {};
+    }
+
+private:
+    static bool fresh(const a081_haptic_request &request, std::uint64_t stamp)
+    {
+        return request.monotonic_ns && stamp >= request.monotonic_ns &&
+            stamp - request.monotonic_ns < A081_HAPTIC_MAX_AGE_NS;
+    }
+    std::array<a081_haptic_request, 2> pending{};
+    std::array<std::uint64_t, 2> last_controller{};
+};
+
 void set_radio_scheduling()
 {
     // Stock SerialPortLoop requests nice -11 and FIFO44 through the JNI
@@ -96,6 +182,8 @@ int main(int argc, char **argv) try {
         std::puts(A081_CONTROLLER_INPUT_ABI_DESCRIPTOR); return 0;
     }
     std::string socket_path; unsigned seconds = 30; bool camera_time = false;
+    int haptic_fd = -1;
+    uid_t haptic_uid = static_cast<uid_t>(-1);
     for (int i = 1; i < argc; ++i) {
         const std::string arg(argv[i]);
         if (arg == "--socket" && i+1 < argc) socket_path = argv[++i];
@@ -103,6 +191,15 @@ int main(int argc, char **argv) try {
             char *end = nullptr; errno = 0; auto n = std::strtoul(argv[++i], &end, 10);
             if (errno || !*argv[i] || *end || n > 3600) throw std::runtime_error("seconds must be0(continuous)..3600");
             seconds = n;
+        } else if ((arg == "--haptic-fd" || arg == "--haptic-uid") && i+1 < argc) {
+            char *end = nullptr;
+            errno = 0;
+            const char *value = argv[++i];
+            const auto n = std::strtoul(value, &end, 10);
+            if (errno || !*value || *end || n > INT32_MAX)
+                throw std::runtime_error("Invalid inherited haptic endpoint argument");
+            if (arg == "--haptic-fd") haptic_fd = int(n);
+            else haptic_uid = uid_t(n);
         } else if (arg == "--camera-time") camera_time = true;
         else throw std::runtime_error("Usage: controller-radio --socket PATH [--seconds0..3600] [--camera-time]");
     }
@@ -125,6 +222,17 @@ int main(int argc, char **argv) try {
     Fd dev; dev.fd = open("/dev/a081-nordic", O_RDWR | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
     if (dev.fd < 0) throw std::runtime_error("Cannot open Nordic");
     static_assert(sizeof(a081_nordic_dual_transfer) == 168);
+    Fd haptic_socket;
+    if (haptic_fd >= 0) {
+        int type = 0, passcred = 0;
+        socklen_t length = sizeof(type);
+        if (haptic_uid == static_cast<uid_t>(-1) ||
+            getsockopt(haptic_fd, SOL_SOCKET, SO_TYPE, &type, &length) || type != SOCK_DGRAM ||
+            getsockopt(haptic_fd, SOL_SOCKET, SO_PASSCRED, &passcred, &length) || !passcred)
+            throw std::runtime_error("Expected inherited haptic datagram socket with credentials");
+        haptic_socket.fd = haptic_fd;
+    }
+    Haptics haptics;
     setvbuf(stdout, nullptr, _IOLBF, 0); signal(SIGINT, stop); signal(SIGTERM, stop);
     set_radio_scheduling();
     std::uint64_t sequence=0, requests=0, transmitted=0, discarded=0, version_time[2]{}, last_sof[2]{}, type7[2]{}, fresh[2]{};
@@ -139,8 +247,8 @@ int main(int argc, char **argv) try {
     const auto deadline = now(CLOCK_MONOTONIC) + std::uint64_t(seconds) * 1000000000ULL;
     std::puts(camera_time ? "{\"kind\":\"radio_scope\",\"timestamp_tx\":true,\"tail_policy\":\"EE_padding_adapter_choice_not_stock_stack_copy\",\"pairing_modified\":false,\"firmware_written\":false}" : "{\"kind\":\"radio_scope\",\"timestamp_tx\":false}");
     while (!stopped && (!seconds || now(CLOCK_MONOTONIC) < deadline)) {
-        pollfd p[2]{{dev.fd,POLLIN,0},{sock.fd,POLLIN,0}};
-        int r = poll(p,2,50); if (r < 0 && errno == EINTR) continue;
+        pollfd p[3]{{dev.fd,POLLIN,0},{sock.fd,POLLIN,0},{haptic_socket.fd,POLLIN,0}};
+        int r = poll(p,3,50); if (r < 0 && errno == EINTR) continue;
         if (r < 0) throw std::runtime_error("poll");
         for (const auto &x : p) if (x.revents & (POLLERR|POLLHUP|POLLNVAL)) throw std::runtime_error("Radio/helper disconnected");
         if (p[1].revents & POLLIN) {
@@ -167,6 +275,7 @@ int main(int argc, char **argv) try {
                 pending[request.hand]=request;have[request.hand]=true;
             }
         }
+        if (p[2].revents&POLLIN) haptics.receive(haptic_socket.fd, haptic_uid);
         if (!(p[0].revents&POLLIN)) continue;
         a081_nordic_dual_transfer transfer{};std::memset(transfer.tx,0xee,sizeof(transfer.tx));
         int selected=-1;
@@ -180,6 +289,9 @@ int main(int argc, char **argv) try {
                !a081_radio_pack_camera_time_body(q.exposure_phase,q.ctrl_exposure_start_boottime_ns,static_cast<a081_controller_hand>(selected),version[selected],&body)) {have[selected]=false;selected=-1;++discarded;}
             else std::memcpy(transfer.tx,body.bytes,sizeof(body.bytes));
         }
+        // Leave timestamp selection and framing untouched. Motor commands use
+        // a free SPI exchange with the same FIFO retention rule as stock.
+        const int motor = selected < 0 ? haptics.pack(transfer.tx, now(CLOCK_MONOTONIC)) : -1;
         const int result=ioctl(dev.fd,A081_NORDIC_IOC_DUAL_TRANSFER,&transfer);
         if(result<0) {
             if(errno==EAGAIN||errno==EINTR)continue;
@@ -187,6 +299,8 @@ int main(int argc, char **argv) try {
             throw std::runtime_error("Nordic72 transfer");
         }
         const ClockObservation clock{now(CLOCK_BOOTTIME), now(CLOCK_MONOTONIC), now(CLOCK_BOOTTIME)};
+        if (motor >= 0 && (transfer.rx[0] != 0xff || transfer.rx[1] != 0xff))
+            haptics.sent(unsigned(motor), transfer.irq_sequence);
         for (auto &watch : followups) if (watch.remaining) {
             std::printf("{\"kind\":\"radio_timestamp_followup\",\"first_rx_sequence\":%llu,\"origin_hand\":%u,\"origin_attempt\":%llu,\"origin_request_sequence\":%llu,\"origin_irq_sequence\":%llu,\"successor_exchange\":%u,\"timestamp_tx_hand\":%d",
                 static_cast<unsigned long long>(sequence+1), watch.hand,
@@ -245,7 +359,9 @@ int main(int argc, char **argv) try {
                 }
                 version[hand]=data[22];version_time[hand]=now(CLOCK_MONOTONIC);
             }
-            if(type==7){++type7[hand];std::uint64_t clock=0;for(unsigned i=0;i<4;++i)clock|=std::uint64_t(data[3+i])<<(8*i);clock|=std::uint64_t(data[29])<<32|std::uint64_t(data[30])<<40;std::uint64_t ns=0;
+            if(type==7){
+                haptics.saw_controller(hand, clock.monotonic);
+                ++type7[hand];std::uint64_t clock=0;for(unsigned i=0;i<4;++i)clock|=std::uint64_t(data[3+i])<<(8*i);clock|=std::uint64_t(data[29])<<32|std::uint64_t(data[30])<<40;std::uint64_t ns=0;
                 if(version_time[hand] && a081_radio_scale_type7_time(clock,version[hand],&ns) && a081_radio_stock_time_window(ns,now(CLOCK_BOOTTIME),nullptr))++fresh[hand];}
         }
         else if(decode_result==A081_WIRE_HEADER) ++invalid_headers;
